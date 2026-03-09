@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+data/accounts.json
+
+# macOS / editor / test cache
+.DS_Store
+.pytest_cache/
+
+# local env
+.venv/
+
+# runtime local data / secrets
+data/.secret.key
+data/settings.json
+data/launch.log
+data/python_launcher_path.txt
