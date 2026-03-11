@@ -3,33 +3,35 @@
 
 from __future__ import annotations
 
-from tkinter import BOTH, LEFT, RIGHT, VERTICAL, W, Menu
+from tkinter import BOTH, LEFT, RIGHT, VERTICAL, W, Frame as TkFrame, Menu
 from tkinter import ttk
 
 from page_bitget import BitgetOneToManyPage
 from page_onchain import OnchainTransferPage
+from table_import_utils import IMPORT_TARGET_PURPLE
 
 
 def build_ui(app) -> None:
-    shell = ttk.Frame(app.root, padding=8)
+    shell = ttk.Frame(app.root, padding=12)
     shell.pack(fill=BOTH, expand=True)
 
     topbar = ttk.Frame(shell)
-    topbar.pack(fill="x", pady=(0, 6))
+    topbar.pack(fill="x", pady=(0, 8))
+
     ip_box = ttk.Frame(topbar)
-    ip_box.pack(side=RIGHT)
-    ttk.Label(ip_box, text="当前公网IP").pack(side=LEFT)
-    ttk.Label(ip_box, textvariable=app.ip_var, foreground="#0b62c4").pack(side=LEFT, padx=(8, 0))
+    ip_box.pack(side=LEFT)
+    ttk.Label(ip_box, text="当前公网IP", style="Subtle.TLabel").pack(side=LEFT)
+    ttk.Label(ip_box, textvariable=app.ip_var, style="Value.TLabel").pack(side=LEFT, padx=(8, 0))
     app.btn_detect_ip = ttk.Button(ip_box, text="检测IP", command=app.start_detect_ip)
     app.btn_detect_ip.pack(side=LEFT, padx=(10, 0))
 
     app.menu_tabs = ttk.Notebook(shell, style="Menu.TNotebook")
     app.menu_tabs.pack(fill=BOTH, expand=True)
 
-    main = ttk.Frame(app.menu_tabs, padding=10)
+    main = ttk.Frame(app.menu_tabs, padding=12)
     app.menu_tabs.add(main, text=app.MENU_ITEMS[0])
     for title in app.MENU_ITEMS[1:]:
-        page = ttk.Frame(app.menu_tabs, padding=16)
+        page = ttk.Frame(app.menu_tabs, padding=12)
         app.menu_tabs.add(page, text=title)
         if title == "bg交易所1对多":
             app.bg_page = BitgetOneToManyPage(page)
@@ -37,9 +39,6 @@ def build_ui(app) -> None:
             app.onchain_page = OnchainTransferPage(page)
         else:
             build_waiting_page(app, page, title)
-
-    warning = "⚠️ 提现属于真实资金操作：默认模拟执行，确认参数无误后再关闭模拟。"
-    ttk.Label(main, text=warning, foreground="#a94442").pack(anchor=W, pady=(0, 8))
 
     setting = ttk.LabelFrame(main, text="统一配置（所有选中账号共用）", padding=10)
     setting.pack(fill="x", pady=(0, 10))
@@ -69,7 +68,7 @@ def build_ui(app) -> None:
     app.ent_random_min = ttk.Entry(app.amount_ctrl, textvariable=app.random_min_var, width=8)
     app.lbl_random_sep = ttk.Label(app.amount_ctrl, text="~")
     app.ent_random_max = ttk.Entry(app.amount_ctrl, textvariable=app.random_max_var, width=8)
-    app.lbl_amount_all_hint = ttk.Label(app.amount_ctrl, text="按可用余额", foreground="#666")
+    app.lbl_amount_all_hint = ttk.Label(app.amount_ctrl, text="按可用余额", style="Subtle.TLabel")
     app._apply_amount_input_layout()
 
     app.chk_dry_run = ttk.Checkbutton(setting, text="模拟执行", variable=app.dry_run_var)
@@ -84,9 +83,7 @@ def build_ui(app) -> None:
     app.lbl_source_api_secret = ttk.Label(setting, text="提现账号API Secret*")
     app.ent_source_api_secret = ttk.Entry(setting, textvariable=app.source_api_secret_var, width=36, show="*")
     app.lbl_source_balance_title = ttk.Label(setting, text="提现账号余额")
-    app.lbl_source_balance_val = ttk.Label(setting, textvariable=app.source_balance_var, foreground="#0b62c4")
-
-    app.lbl_batch_hint = ttk.Label(setting, text="批量操作按勾选账号执行", foreground="#666")
+    app.lbl_source_balance_val = ttk.Label(setting, textvariable=app.source_balance_var, style="Value.TLabel")
     app._apply_setting_layout(compact=False)
 
     app.table_wrap = ttk.Frame(main)
@@ -96,13 +93,18 @@ def build_ui(app) -> None:
 
     columns = ("checked", "idx", "api_key", "api_secret", "address", "status", "balance")
     app.tree = ttk.Treeview(app.table_wrap, columns=columns, show="headings", selectmode="extended", height=18)
-    app.tree.heading("checked", text="勾选")
-    app.tree.heading("idx", text="编号")
-    app.tree.heading("api_key", text="API Key(掩码)")
-    app.tree.heading("api_secret", text="API Secret(掩码)")
-    app.tree.heading("address", text="提现地址")
-    app.tree.heading("status", text="执行状态")
-    app.tree.heading("balance", text="账号余额(全币种)")
+    app._tree_column_ids = columns
+    app._tree_heading_base_texts = {
+        "checked": "勾选",
+        "idx": "编号",
+        "api_key": "API Key(掩码)",
+        "api_secret": "API Secret(掩码)",
+        "address": "提现地址",
+        "status": "执行状态",
+        "balance": "账号余额(全币种)",
+    }
+    for column, text in app._tree_heading_base_texts.items():
+        app.tree.heading(column, text=text)
 
     app.tree.column("checked", width=42, anchor="center")
     app.tree.column("idx", width=42, anchor="center")
@@ -115,6 +117,8 @@ def build_ui(app) -> None:
     app.tree.tag_configure("st_running", foreground="#1d5fbf", background="#eaf2ff")
     app.tree.tag_configure("st_success", foreground="#1b7f3b", background="#eaf8ef")
     app.tree.tag_configure("st_failed", foreground="#b02a37", background="#fdecef")
+    app.tree.tag_configure("st_submitted", foreground="#6d28d9", background="#f3e8ff")
+    app.tree.tag_configure("st_incomplete", foreground="#8a6d3b", background="#fff7e0")
 
     app.tree_ybar = app._make_scrollbar(app.table_wrap, orient=VERTICAL, command=app.tree.yview)
     app.tree_xbar = app._make_scrollbar(app.table_wrap, orient="horizontal", command=app.tree.xview)
@@ -122,13 +126,17 @@ def build_ui(app) -> None:
     app.tree.grid(row=0, column=0, sticky="nsew")
     app.tree_ybar.grid(row=0, column=1, sticky="ns")
     app.tree_xbar.grid(row=1, column=0, sticky="ew")
+    app.import_target_bar = TkFrame(app.table_wrap, bg=IMPORT_TARGET_PURPLE, bd=0, highlightthickness=0)
+    app.empty_hint_label = ttk.Label(app.table_wrap, style="Subtle.TLabel", justify="center", anchor="center")
 
+    app.tree.bind("<Button-1>", app._on_tree_pointer_down, add="+")
     app.tree.bind("<Double-Button-1>", app._on_tree_click, add="+")
     app.tree.bind("<Button-2>", app._on_tree_right_click, add="+")
     app.tree.bind("<Button-3>", app._on_tree_right_click, add="+")
     app.tree.bind("<Control-Button-1>", app._on_tree_right_click, add="+")
     app.tree.bind("<Command-v>", app._on_tree_paste)
     app.tree.bind("<Control-v>", app._on_tree_paste)
+    app.empty_hint_label.bind("<Button-1>", lambda _event: app._set_import_target("full", log_change=True))
     app.row_menu = Menu(app.root, tearoff=0)
     app.row_menu.add_command(label="查询余额（当前行）", command=app.start_query_balance_current_row)
     app.row_menu.add_command(label="提现（当前行）", command=app.start_withdraw_current_row)
@@ -138,8 +146,6 @@ def build_ui(app) -> None:
     app.amount_mode_var.trace_add("write", app._on_amount_mode_changed)
     app.coin_var.trace_add("write", app._on_coin_var_changed)
     app.source_api_key_var.trace_add("write", app._on_source_api_changed)
-    app.import_hint_label = ttk.Label(main, text="", foreground="#666")
-    app.import_hint_label.pack(anchor=W, pady=(4, 0))
 
     action1 = ttk.Frame(main)
     action1.pack(fill="x", pady=10)
@@ -154,6 +160,8 @@ def build_ui(app) -> None:
     action2.pack(fill="x", pady=(0, 10))
     ttk.Button(action2, text="按余额刷新币种", command=app.start_refresh_coin_options).pack(side=LEFT)
     ttk.Button(action2, text="查询余额（全币种）", command=app.start_query_balance).pack(side=LEFT, padx=(8, 0))
+    app.lbl_progress = ttk.Label(action2, textvariable=app.progress_var, style="Subtle.TLabel", anchor="w", justify="left")
+    app.lbl_progress.pack(side=LEFT, fill="x", expand=True, padx=(10, 0))
     ttk.Button(action2, text="执行批量提现", style="Action.TButton", command=app.start_batch_withdraw).pack(side=RIGHT)
     ttk.Button(action2, text="失败重试", style="Action.TButton", command=app.start_retry_failed).pack(side=RIGHT, padx=(8, 0))
 
@@ -180,12 +188,14 @@ def build_ui(app) -> None:
     app.root.after_idle(app._resize_tree_columns)
     app.root.after_idle(app._on_log_resize)
     app.root.after_idle(app._on_root_resize)
+    app.root.after_idle(app._apply_import_target_view)
+    app.root.after_idle(app._update_empty_import_hint)
 
 
 def build_waiting_page(_app, page: ttk.Frame, title: str) -> None:
     box = ttk.LabelFrame(page, text=title, padding=16)
     box.pack(fill=BOTH, expand=True)
-    ttk.Label(box, text=f"{title}：等待开发", foreground="#666").pack(anchor=W)
+    ttk.Label(box, text=f"{title}：等待开发", style="Subtle.TLabel").pack(anchor=W)
     ttk.Label(box, text="当前已实现功能：币安提现、bg交易所1对多、链上(EVM)批量转账。").pack(anchor=W, pady=(8, 0))
 
 
@@ -244,7 +254,6 @@ def apply_setting_layout(app, compact: bool) -> None:
         app.ent_source_api_secret,
         app.lbl_source_balance_title,
         app.lbl_source_balance_val,
-        app.lbl_batch_hint,
     ]
     for w in widgets:
         w.grid_forget()
@@ -268,7 +277,6 @@ def apply_setting_layout(app, compact: bool) -> None:
         app.lbl_threads.grid(row=1, column=2, sticky=W, pady=(8, 0))
         app.spin_threads.grid(row=1, column=3, sticky=W, padx=(4, 10), pady=(8, 0))
 
-        hint_row = 2
         if is_one:
             app.lbl_source_api_key.grid(row=2, column=0, sticky=W, pady=(8, 0))
             app.ent_source_api_key.grid(row=2, column=1, columnspan=5, sticky="ew", padx=(4, 10), pady=(8, 0))
@@ -278,9 +286,6 @@ def apply_setting_layout(app, compact: bool) -> None:
             app.lbl_source_balance_val.grid(row=3, column=1, columnspan=10, sticky=W, padx=(4, 0), pady=(8, 0))
             app.setting_frame.columnconfigure(1, weight=1)
             app.setting_frame.columnconfigure(7, weight=1)
-            hint_row = 4
-
-        app.lbl_batch_hint.grid(row=hint_row, column=0, columnspan=11, sticky=W, pady=(8, 0))
         return
 
     app.lbl_mode.grid(row=0, column=0, sticky=W)
@@ -308,9 +313,6 @@ def apply_setting_layout(app, compact: bool) -> None:
         app.ent_source_api_secret.grid(row=5, column=1, columnspan=3, sticky="ew", padx=(4, 0), pady=(8, 0))
         app.lbl_source_balance_title.grid(row=6, column=0, sticky=W, pady=(8, 0))
         app.lbl_source_balance_val.grid(row=6, column=1, columnspan=3, sticky=W, padx=(4, 0), pady=(8, 0))
-        next_row = 7
-
-    app.lbl_batch_hint.grid(row=next_row, column=0, columnspan=4, sticky=W, pady=(8, 0))
 
     app.setting_frame.columnconfigure(1, weight=1)
     app.setting_frame.columnconfigure(3, weight=1)
@@ -318,6 +320,9 @@ def apply_setting_layout(app, compact: bool) -> None:
 
 def on_table_resize(app, _event=None) -> None:
     app._resize_tree_columns()
+    if hasattr(app, "_apply_import_target_view"):
+        app._apply_import_target_view()
+    app._update_empty_import_hint()
 
 
 def resize_tree_columns(app) -> None:
@@ -359,3 +364,58 @@ def on_log_resize(app, _event=None) -> None:
     msg_width = max(300, width - 190)
     app.log_tree.column("time", width=170, stretch=False)
     app.log_tree.column("msg", width=msg_width, stretch=True)
+
+
+def empty_import_hint_text(app) -> str:
+    if app._is_one_to_many_mode():
+        return (
+            "导入格式\n"
+            "每行一个提现地址\n\n"
+            "导入方式\n"
+            "点击中间空白处后按 Cmd+V / Ctrl+V 可按原格式导入\n"
+            "点击“提现地址”表头后可按列粘贴\n"
+            "也可继续使用“粘贴导入”或“导入 TXT”"
+        )
+    return (
+        "导入格式\n"
+        "每行：API Key API Secret 提现地址\n\n"
+        "导入方式\n"
+        "点击中间空白处后按 Cmd+V / Ctrl+V 可按原格式导入\n"
+        "点击 API Key / API Secret / 提现地址表头后可按列粘贴\n"
+        "也可继续使用“粘贴导入”或“导入 TXT”"
+    )
+
+
+def update_empty_import_hint(app) -> None:
+    label = getattr(app, "empty_hint_label", None)
+    if label is None:
+        return
+
+    width = 0
+    table_wrap = getattr(app, "table_wrap", None)
+    if table_wrap is not None and hasattr(table_wrap, "winfo_width"):
+        try:
+            width = int(table_wrap.winfo_width())
+        except Exception:
+            width = 0
+    wraplength = max(320, width - 120) if width > 0 else 560
+
+    try:
+        label.configure(text=empty_import_hint_text(app), wraplength=wraplength)
+    except Exception:
+        pass
+
+    if app._is_one_to_many_mode():
+        has_rows = bool(getattr(app.store, "one_to_many_addresses", []))
+    else:
+        has_rows = bool(getattr(app.store, "accounts", [])) or bool(getattr(app, "account_import_drafts", []))
+
+    try:
+        if has_rows:
+            label.place_forget()
+        else:
+            label.place(relx=0.5, rely=0.45, anchor="center")
+            if hasattr(label, "lift"):
+                label.lift()
+    except Exception:
+        pass

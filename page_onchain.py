@@ -10,7 +10,7 @@ import threading
 import time
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, W, Y, BooleanVar, DoubleVar, Menu, Scrollbar, StringVar
+from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, W, Y, BooleanVar, DoubleVar, Frame as TkFrame, Menu, Scrollbar, StringVar
 from tkinter import messagebox, ttk
 
 from api_clients import EvmClient
@@ -18,7 +18,18 @@ from app_paths import ONCHAIN_DATA_FILE
 from core_models import EvmToken, OnchainPairEntry, WithdrawRuntimeParams
 from shared_utils import LOG_MAX_ROWS, append_log_row, decimal_to_text, make_scrollbar, mask_text, parse_worker_threads, random_decimal_between
 from stores import OnchainStore
+from table_import_utils import (
+    IMPORT_TARGET_PURPLE,
+    column_name_from_identifier,
+    heading_text,
+    merge_column_values,
+    parse_single_value_lines,
+    update_import_target_bar,
+)
+import task_progress
 from ui_dialogs import PasteImportDialog
+
+SUBMITTED_TIMEOUT_SECONDS = 10.0
 
 class OnchainTransferPage:
     MODE_M2M = "多对多"
@@ -33,20 +44,18 @@ class OnchainTransferPage:
     TREE_COL_MIN_WIDTHS = {
         "checked": 42,
         "idx": 42,
-        "source": 230,
-        "source_addr": 170,
-        "target": 220,
+        "source": 330,
+        "target": 420,
         "status": 96,
-        "balance": 160,
+        "balance": 80,
     }
     TREE_COL_WEIGHTS = {
         "checked": 1,
         "idx": 1,
-        "source": 4,
-        "source_addr": 3,
-        "target": 4,
+        "source": 5,
+        "target": 7,
         "status": 2,
-        "balance": 3,
+        "balance": 1,
     }
 
     def __init__(self, parent):
@@ -55,19 +64,23 @@ class OnchainTransferPage:
         self.store = OnchainStore(ONCHAIN_DATA_FILE)
         self.client = EvmClient()
         self.is_running = False
-        self._compact_mode: bool | None = None
+        self._layout_mode: str | None = None
 
         self.row_index_map: dict[str, int] = {}
         self.row_key_by_row_id: dict[str, str] = {}
         self.row_id_by_key: dict[str, str] = {}
         self.checked_row_keys: set[str] = set()
         self.row_status: dict[str, str] = {}
+        self.row_status_context: dict[str, str] = {}
+        self.query_row_status: dict[str, str] = {}
+        self.query_row_status_context: dict[str, str] = {}
         self.source_balance_cache: dict[str, Decimal] = {}
         self.target_balance_cache: dict[str, Decimal] = {}
         self.source_address_cache: dict[str, str] = {}
         self.source_private_key_cache: dict[str, str] = {}
         self.current_tokens: dict[str, EvmToken] = {}
         self.custom_tokens_by_network: dict[str, dict[str, EvmToken]] = {"ETH": {}, "BSC": {}}
+        self._query_row_keys_by_source: dict[str, list[str]] = {}
         self.wallet_cache_lock = threading.Lock()
 
         self.mode_var = StringVar(value=self.MODE_M2M)
@@ -86,18 +99,25 @@ class OnchainTransferPage:
         self.target_address_var = StringVar(value="")
         self.source_balance_var = StringVar(value="-")
         self.target_balance_var = StringVar(value="-")
+        self.progress_var = StringVar(value=task_progress.idle_text("转账总额"))
+        self._active_progress_kind = ""
+        self._active_progress_keys: list[str] = []
+        self._progress_amount_label = "转账总额"
+        self._summary_balance_text = "-"
+        self._summary_amount_text = "-"
+        self._summary_gas_text = "-"
+        self._import_target = "full"
+        self.m2m_import_drafts: list[dict[str, str]] = []
+        self.checked_m2m_draft_rows: set[int] = set()
 
         self._build_ui()
         self._load_data()
 
     def _build_ui(self):
-        main = ttk.Frame(self.parent, padding=10)
+        main = ttk.Frame(self.parent, padding=12)
         main.pack(fill=BOTH, expand=True)
 
-        warning = "⚠️ 链上转账属于真实资金操作：默认模拟执行，确认参数无误后再关闭模拟。"
-        ttk.Label(main, text=warning, foreground="#a94442").pack(anchor=W, pady=(0, 8))
-
-        setting = ttk.LabelFrame(main, text="链上批量转账配置（EVM）", padding=10)
+        setting = ttk.LabelFrame(main, text="链上批量转账配置（EVM）", padding=14)
         setting.pack(fill="x", pady=(0, 10))
         self.setting_frame = setting
 
@@ -136,7 +156,7 @@ class OnchainTransferPage:
         self.ent_random_min = ttk.Entry(self.amount_ctrl, textvariable=self.random_min_var, width=8)
         self.lbl_random_sep = ttk.Label(self.amount_ctrl, text="~")
         self.ent_random_max = ttk.Entry(self.amount_ctrl, textvariable=self.random_max_var, width=8)
-        self.lbl_amount_all_hint = ttk.Label(self.amount_ctrl, text="按钱包可用余额", foreground="#666")
+        self.lbl_amount_all_hint = ttk.Label(self.amount_ctrl, text="按钱包可用余额", style="Subtle.TLabel")
         self._apply_amount_layout()
 
         self.chk_dry_run = ttk.Checkbutton(setting, text="模拟执行", variable=self.dry_run_var)
@@ -148,41 +168,44 @@ class OnchainTransferPage:
         self.lbl_source_credential = ttk.Label(setting, text="转出钱包私钥/助记词*")
         self.ent_source_credential = ttk.Entry(setting, textvariable=self.source_credential_var)
         self.lbl_source_balance_title = ttk.Label(setting, text="转出钱包余额")
-        self.lbl_source_balance_val = ttk.Label(setting, textvariable=self.source_balance_var, foreground="#0b62c4")
+        self.lbl_source_balance_val = ttk.Label(setting, textvariable=self.source_balance_var, style="Value.TLabel")
         self.lbl_target_address = ttk.Label(setting, text="收款地址*")
         self.ent_target_address = ttk.Entry(setting, textvariable=self.target_address_var)
         self.lbl_target_balance_title = ttk.Label(setting, text="收款地址余额")
-        self.lbl_target_balance_val = ttk.Label(setting, textvariable=self.target_balance_var, foreground="#0b62c4")
-
-        self.lbl_batch_hint = ttk.Label(setting, text="批量操作按勾选行执行", foreground="#666")
-        self._apply_setting_layout(compact=False)
+        self.lbl_target_balance_val = ttk.Label(setting, textvariable=self.target_balance_var, style="Value.TLabel")
+        self._apply_setting_layout("wide")
 
         self.table_wrap = ttk.Frame(main)
         self.table_wrap.pack(fill=BOTH, expand=True)
         self.table_wrap.columnconfigure(0, weight=1)
         self.table_wrap.rowconfigure(0, weight=1)
 
-        cols = ("checked", "idx", "source", "source_addr", "target", "status", "balance")
+        cols = ("checked", "idx", "source", "target", "status", "balance")
         self.tree = ttk.Treeview(self.table_wrap, columns=cols, show="headings", selectmode="extended", height=16)
-        self.tree.heading("checked", text="勾选")
-        self.tree.heading("idx", text="编号")
-        self.tree.heading("source", text="转出凭证(掩码)")
-        self.tree.heading("source_addr", text="转出地址")
-        self.tree.heading("target", text="接收地址")
-        self.tree.heading("status", text="执行状态")
-        self.tree.heading("balance", text="余额")
+        self._tree_column_ids = cols
+        self._tree_heading_base_texts = {
+            "checked": "勾选",
+            "idx": "编号",
+            "source": "转出凭证",
+            "target": "接收地址",
+            "status": "执行状态",
+            "balance": "余额",
+        }
+        for column, text in self._tree_heading_base_texts.items():
+            self.tree.heading(column, text=text)
 
         self.tree.column("checked", width=42, anchor="center")
         self.tree.column("idx", width=42, anchor="center")
-        self.tree.column("source", width=260, anchor="w")
-        self.tree.column("source_addr", width=180, anchor="w")
-        self.tree.column("target", width=260, anchor="w")
+        self.tree.column("source", width=360, anchor="w")
+        self.tree.column("target", width=420, anchor="w")
         self.tree.column("status", width=110, anchor="center")
-        self.tree.column("balance", width=200, anchor="w")
+        self.tree.column("balance", width=100, anchor="w")
         self.tree.tag_configure("st_waiting", foreground="#8a6d3b", background="#fff7e0")
         self.tree.tag_configure("st_running", foreground="#1d5fbf", background="#eaf2ff")
         self.tree.tag_configure("st_success", foreground="#1b7f3b", background="#eaf8ef")
         self.tree.tag_configure("st_failed", foreground="#b02a37", background="#fdecef")
+        self.tree.tag_configure("st_submitted", foreground="#6d28d9", background="#f3e8ff")
+        self.tree.tag_configure("st_incomplete", foreground="#8a6d3b", background="#fff7e0")
 
         self.tree_ybar = self._make_scrollbar(self.table_wrap, orient=VERTICAL, command=self.tree.yview)
         self.tree_xbar = self._make_scrollbar(self.table_wrap, orient="horizontal", command=self.tree.xview)
@@ -190,21 +213,22 @@ class OnchainTransferPage:
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.tree_ybar.grid(row=0, column=1, sticky="ns")
         self.tree_xbar.grid(row=1, column=0, sticky="ew")
+        self.import_target_bar = TkFrame(self.table_wrap, bg=IMPORT_TARGET_PURPLE, bd=0, highlightthickness=0)
+        self.empty_hint_label = ttk.Label(self.table_wrap, style="Subtle.TLabel", justify="center", anchor="center")
 
+        self.tree.bind("<Button-1>", self._on_tree_pointer_down, add="+")
         self.tree.bind("<Double-Button-1>", self._on_tree_click, add="+")
         self.tree.bind("<Button-2>", self._on_tree_right_click, add="+")
         self.tree.bind("<Button-3>", self._on_tree_right_click, add="+")
         self.tree.bind("<Control-Button-1>", self._on_tree_right_click, add="+")
         self.tree.bind("<Command-v>", self._on_tree_paste)
         self.tree.bind("<Control-v>", self._on_tree_paste)
+        self.empty_hint_label.bind("<Button-1>", lambda _event: self._set_import_target("full", log_change=True))
         self.row_menu = Menu(self.root, tearoff=0)
         self.row_menu.add_command(label="查询余额（当前行）", command=self.start_query_balance_current_row)
         self.row_menu.add_command(label="执行转账（当前行）", command=self.start_transfer_current_row)
         self.row_menu.add_separator()
         self.row_menu.add_command(label="删除（当前行）", command=self.delete_current_row)
-
-        self.import_hint_label = ttk.Label(main, text="", foreground="#666")
-        self.import_hint_label.pack(anchor=W, pady=(4, 0))
 
         action1 = ttk.Frame(main)
         action1.pack(fill="x", pady=10)
@@ -218,6 +242,8 @@ class OnchainTransferPage:
         action2 = ttk.Frame(main)
         action2.pack(fill="x", pady=(0, 10))
         ttk.Button(action2, text="查询余额", command=self.start_query_balance).pack(side=LEFT)
+        self.lbl_progress = ttk.Label(action2, textvariable=self.progress_var, style="Subtle.TLabel", anchor="w", justify="left")
+        self.lbl_progress.pack(side=LEFT, fill="x", expand=True, padx=(10, 0))
         ttk.Button(action2, text="执行批量转账", style="Action.TButton", command=self.start_batch_transfer).pack(side=RIGHT)
         ttk.Button(action2, text="失败重试", style="Action.TButton", command=self.start_retry_failed).pack(side=RIGHT, padx=(8, 0))
 
@@ -252,6 +278,8 @@ class OnchainTransferPage:
         self.root.after_idle(self._resize_tree_columns)
         self.root.after_idle(self._on_log_resize)
         self.root.after_idle(self._on_root_resize)
+        self.root.after_idle(self._apply_import_target_view)
+        self.root.after_idle(self._update_empty_hint)
 
     @staticmethod
     def _make_scrollbar(parent, orient, command):
@@ -296,6 +324,24 @@ class OnchainTransferPage:
         val = (amount * cls._factor_by_decimals(decimals)).to_integral_value(rounding=ROUND_FLOOR)
         return int(val)
 
+    def _network_fee_symbol(self, network: str) -> str:
+        try:
+            symbol = self.client.get_symbol(network)
+        except Exception:
+            symbol = ""
+        return symbol or network.strip().upper() or "-"
+
+    def _gas_fee_amount_text(self, network: str, fee_wei: int) -> str:
+        fee_text = self._decimal_to_text(self._units_to_amount(int(fee_wei), 18))
+        symbol = self._network_fee_symbol(network)
+        return f"{fee_text} {symbol}"
+
+    def _estimated_gas_fee_text(self, network: str, fee_wei: int) -> str:
+        return f"预估 {self._gas_fee_amount_text(network, fee_wei)}"
+
+    def _token_amount_text(self, symbol: str, amount: Decimal) -> str:
+        return f"{self._decimal_to_text(amount)} {symbol.strip().upper()}"
+
     def _runtime_worker_threads(self) -> int:
         raw = self.threads_var.get() if hasattr(self, "threads_var") else 2
         return parse_worker_threads(raw, default=2)
@@ -310,6 +356,11 @@ class OnchainTransferPage:
         return self._mask(s, head=4, tail=4)
 
     @staticmethod
+    def _display_credential(credential: str) -> str:
+        s = credential.strip()
+        return s if s else "-"
+
+    @staticmethod
     def _status_text(status: str) -> str:
         if status == "waiting":
             return "等待中"
@@ -319,6 +370,8 @@ class OnchainTransferPage:
             return "完成"
         if status == "failed":
             return "失败"
+        if status == "submitted":
+            return "确认中"
         return "-"
 
     @staticmethod
@@ -331,6 +384,8 @@ class OnchainTransferPage:
             return "st_success"
         if status == "failed":
             return "st_failed"
+        if status == "submitted":
+            return "st_submitted"
         return ""
 
     @staticmethod
@@ -372,17 +427,384 @@ class OnchainTransferPage:
         addr = self.source_address_cache.get(source, "")
         return addr if addr else "-"
 
-    def _set_status(self, row_key: str, status: str):
-        self.row_status[row_key] = status
+    def _ensure_query_status_store(self) -> dict[str, str]:
+        if not hasattr(self, "query_row_status"):
+            self.query_row_status = {}
+        return self.query_row_status
+
+    def _display_status(self, row_key: str) -> str:
+        query_status = self._ensure_query_status_store()
+        if row_key in query_status and self._context_matches(row_key, getattr(self, "query_row_status_context", {})):
+            return query_status.get(row_key, "")
+        if self._context_matches(row_key, getattr(self, "row_status_context", {})):
+            return getattr(self, "row_status", {}).get(row_key, "")
+        return ""
+
+    def _available_import_targets(self) -> dict[str, str]:
+        mode = self._mode()
+        if mode == self.MODE_1M:
+            return {
+                "full": "整行导入",
+                "target": "接收地址列",
+            }
+        if mode == self.MODE_M1:
+            return {
+                "full": "整行导入",
+                "source": "转出凭证列",
+            }
+        return {
+            "full": "整行导入",
+            "source": "转出凭证列",
+            "target": "接收地址列",
+        }
+
+    def _current_import_target(self) -> str:
+        target = str(getattr(self, "_import_target", "full") or "full")
+        if target not in self._available_import_targets():
+            target = "full"
+            self._import_target = target
+        return target
+
+    def _set_import_target(self, target: str, *, log_change: bool = False):
+        targets = self._available_import_targets()
+        prev = self._current_import_target()
+        if target not in targets:
+            target = "full"
+        self._import_target = target
+        self._apply_import_target_view()
+        try:
+            self.tree.focus_set()
+        except Exception:
+            pass
+        if log_change and prev != target:
+            self.log(f"已切换粘贴目标：{targets[target]}")
+
+    def _apply_import_target_view(self):
+        target = self._current_import_target()
+        importable = set(self._available_import_targets()) - {"full"}
+        for column, text in self._tree_heading_base_texts.items():
+            self.tree.heading(column, text=heading_text(text, active=(column == target and column in importable)))
+        update_import_target_bar(self.import_target_bar, self.tree, self._tree_column_ids, target)
+
+    def _on_tree_pointer_down(self, event):
+        region = self.tree.identify("region", event.x, event.y)
+        if region == "separator":
+            return None
+        if region == "heading":
+            column_id = self.tree.identify_column(event.x)
+            column = column_name_from_identifier(self._tree_column_ids, column_id)
+            self._set_import_target(column if column in self._available_import_targets() else "full", log_change=True)
+            return None
+        self._set_import_target("full", log_change=True)
+        return None
+
+    def _selected_draft_index(self) -> int | None:
+        tree = getattr(self, "tree", None)
+        if tree is None or not hasattr(tree, "selection"):
+            return None
+        selected = tuple(tree.selection())
+        if not selected:
+            return None
+        return getattr(self, "draft_row_index_map", {}).get(selected[0])
+
+    def _ensure_checked_m2m_draft_rows(self) -> set[int]:
+        checked = getattr(self, "checked_m2m_draft_rows", None)
+        if checked is None:
+            checked = set()
+            self.checked_m2m_draft_rows = checked
+        return checked
+
+    def _normalize_context_target(self, value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        try:
+            return self._validate_recipient_address(raw, "收款地址")
+        except Exception:
+            return raw
+
+    def _current_row_context(self, row_key: str) -> str:
+        key = str(row_key or "").strip()
+        if key.startswith("1m:"):
+            if not hasattr(self, "source_credential_var"):
+                return ""
+            return self.source_credential_var.get().strip()
+        if key.startswith("m1:"):
+            if not hasattr(self, "target_address_var"):
+                return ""
+            return self._normalize_context_target(self.target_address_var.get().strip())
+        return ""
+
+    def _row_context_for_values(self, row_key: str, source: str = "", target: str = "") -> str:
+        key = str(row_key or "").strip()
+        if key.startswith("1m:"):
+            return str(source or "").strip()
+        if key.startswith("m1:"):
+            return self._normalize_context_target(target)
+        return ""
+
+    def _context_matches(self, row_key: str, context_map: dict[str, str]) -> bool:
+        key = str(row_key or "").strip()
+        if key not in context_map:
+            return True
+        return context_map.get(key, "") == self._current_row_context(key)
+
+    def _mark_row_status_context(self, row_key: str, context_sig: str) -> None:
+        key = str(row_key or "").strip()
+        if not hasattr(self, "row_status_context"):
+            self.row_status_context = {}
+        if key.startswith("m2m:"):
+            self.row_status_context.pop(key, None)
+            return
+        self.row_status_context[key] = str(context_sig or "")
+
+    def _mark_query_status_context(self, row_key: str, context_sig: str) -> None:
+        key = str(row_key or "").strip()
+        if not hasattr(self, "query_row_status_context"):
+            self.query_row_status_context = {}
+        if key.startswith("m2m:"):
+            self.query_row_status_context.pop(key, None)
+            return
+        self.query_row_status_context[key] = str(context_sig or "")
+
+    def _mark_query_status_contexts(self, row_keys: list[str], context_sig: str) -> None:
+        for row_key in row_keys:
+            self._mark_query_status_context(row_key, context_sig)
+
+    def _validate_recipient_address(self, value: str, field_label: str = "收款地址") -> str:
+        validator = getattr(self.client, "validate_evm_address", None)
+        if callable(validator):
+            return str(validator(value, field_label))
+        raw = str(value or "").strip()
+        if not getattr(self.client, "is_address", lambda _v: False)(raw):
+            raise RuntimeError(f"{field_label}格式错误：{raw}")
+        return raw
+
+    def _try_validate_recipient_address(self, value: str, field_label: str = "收款地址") -> str | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        return self._validate_recipient_address(raw, field_label)
+
+    def _warn_if_draft_selected(self) -> bool:
+        if self._selected_draft_index() is None:
+            return False
+        messagebox.showwarning("提示", "当前行为待补齐数据，请先补齐转出凭证和接收地址")
+        return True
+
+    def _promote_complete_m2m_drafts(self) -> tuple[int, int]:
+        ready: list[OnchainPairEntry] = []
+        remaining: list[dict[str, str]] = []
+        for row in self.m2m_import_drafts:
+            source = str(row.get("source", "") or "").strip()
+            target = str(row.get("target", "") or "").strip()
+            if source and target:
+                ready.append(OnchainPairEntry(source=source, target=target))
+            else:
+                remaining.append(
+                    {
+                        "source": source,
+                        "target": target,
+                    }
+                )
+        self.m2m_import_drafts = remaining
+        if not ready:
+            return 0, 0
+        created = self.store.upsert_multi_to_multi(ready)
+        return len(ready), created
+
+    def _import_m2m_column(self, field: str, lines: list[str], source_name: str):
+        if field == "target":
+            values = [
+                self._validate_recipient_address(value, f"第 {i} 行接收地址")
+                for i, value in enumerate(parse_single_value_lines(lines, "接收地址"), start=1)
+            ]
+        else:
+            values = parse_single_value_lines(lines, "转出凭证", allow_inner_whitespace=True)
+        if not values:
+            messagebox.showwarning("提示", "没有可导入的数据")
+            return
+        merge_column_values(self.m2m_import_drafts, ("source", "target"), field, values)
+        completed, created = self._promote_complete_m2m_drafts()
+        if completed:
+            self.checked_row_keys = set(self._active_row_keys())
+        self._refresh_tree()
+        parts = [f"{source_name}导入完成：写入 {len(values)} 条{self._available_import_targets()[field]}"]
+        if completed:
+            parts.append(f"补齐 {completed} 条")
+        if created:
+            parts.append(f"新增 {created} 条")
+        if self.m2m_import_drafts:
+            parts.append(f"待补齐 {len(self.m2m_import_drafts)} 行")
+        self.log("，".join(parts))
+
+    def _empty_hint_text(self) -> str:
+        mode = self._mode()
+        if mode == self.MODE_1M:
+            return (
+                "导入格式\n"
+                "每行一个接收地址\n\n"
+                "导入方式\n"
+                "先在上方填写转出钱包私钥或助记词\n"
+                "点击中间空白处后按 Cmd+V / Ctrl+V 可按原格式导入\n"
+                "点击“接收地址”表头后可按列粘贴，也可继续使用“粘贴导入”/“导入 TXT”"
+            )
+        if mode == self.MODE_M1:
+            return (
+                "导入格式\n"
+                "每行一个转出钱包私钥或助记词\n\n"
+                "导入方式\n"
+                "先在上方填写收款地址\n"
+                "点击中间空白处后按 Cmd+V / Ctrl+V 可按原格式导入\n"
+                "点击“转出凭证”表头后可按列粘贴，也可继续使用“粘贴导入”/“导入 TXT”"
+            )
+        return (
+            "导入格式\n"
+            "每行：转出钱包私钥或助记词 接收地址\n\n"
+            "导入方式\n"
+            "点击中间空白处后按 Cmd+V / Ctrl+V 可按原格式导入\n"
+            "点击“转出凭证”或“接收地址”表头后可按列粘贴\n"
+            "也可继续使用“粘贴导入”或“导入 TXT”"
+        )
+
+    def _update_empty_hint(self):
+        label = getattr(self, "empty_hint_label", None)
+        if label is None:
+            return
+        width = 0
+        if hasattr(self, "table_wrap") and hasattr(self.table_wrap, "winfo_width"):
+            try:
+                width = int(self.table_wrap.winfo_width())
+            except Exception:
+                width = 0
+        wraplength = max(340, width - 120) if width > 0 else 620
+        try:
+            label.configure(text=self._empty_hint_text(), wraplength=wraplength)
+        except Exception:
+            pass
+
+        if self._is_mode_m2m():
+            has_rows = bool(self.store.multi_to_multi_pairs) or bool(getattr(self, "m2m_import_drafts", []))
+        elif self._is_mode_1m():
+            has_rows = bool(self.store.one_to_many_addresses)
+        else:
+            has_rows = bool(self.store.many_to_one_sources)
+        try:
+            if has_rows:
+                label.place_forget()
+            else:
+                label.place(relx=0.5, rely=0.45, anchor="center")
+                if hasattr(label, "lift"):
+                    label.lift()
+        except Exception:
+            pass
+
+    def _update_row_view(self, row_key: str):
+        if not hasattr(self, "tree"):
+            return
         row_id = self.row_id_by_key.get(row_key)
         if not row_id or row_id not in self.row_index_map:
             return
-        values = list(self.tree.item(row_id, "values"))
-        if len(values) >= 7:
-            values[5] = self._status_text(status)
-            self.tree.item(row_id, values=values)
+
+        idx = self.row_index_map[row_id]
+        checked = "✓" if row_key in self.checked_row_keys else ""
+        status = self._display_status(row_key)
+        mode = self._mode()
+
+        if mode == self.MODE_M2M:
+            if not (0 <= idx < len(self.store.multi_to_multi_pairs)):
+                return
+            item = self.store.multi_to_multi_pairs[idx]
+            values = (
+                checked,
+                idx + 1,
+                self._display_credential(item.source),
+                item.target,
+                self._status_text(status),
+                self._balance_text_for_source(item.source),
+            )
+        elif mode == self.MODE_1M:
+            if not (0 <= idx < len(self.store.one_to_many_addresses)):
+                return
+            source = self.source_credential_var.get().strip()
+            target = self.store.one_to_many_addresses[idx]
+            values = (
+                checked,
+                idx + 1,
+                self._display_credential(source),
+                target,
+                self._status_text(status),
+                self._balance_text_for_target(target),
+            )
+        else:
+            if not (0 <= idx < len(self.store.many_to_one_sources)):
+                return
+            source = self.store.many_to_one_sources[idx]
+            target = self.target_address_var.get().strip()
+            values = (
+                checked,
+                idx + 1,
+                self._display_credential(source),
+                target if target else "-",
+                self._status_text(status),
+                self._balance_text_for_source(source),
+            )
+
+        self.tree.item(row_id, values=values)
         tag = self._status_tag(status)
         self.tree.item(row_id, tags=(tag,) if tag else ())
+
+    def _update_rows_view(self, row_keys: list[str]):
+        for row_key in row_keys:
+            self._update_row_view(row_key)
+
+    @staticmethod
+    def _unique_row_keys(row_keys: list[str]) -> list[str]:
+        return task_progress.unique_keys(row_keys)
+
+    def _progress_store(self, kind: str) -> dict[str, str]:
+        if kind == "query":
+            return self._ensure_query_status_store()
+        return self.row_status
+
+    def _begin_progress(self, kind: str, row_keys: list[str]):
+        task_progress.begin(self, kind, row_keys, amount_label="转账总额")
+
+    def _progress_counts(self, kind: str, row_keys: list[str]) -> tuple[int, int, int, int, int]:
+        return task_progress.progress_counts(self, kind, row_keys)
+
+    def _refresh_progress_display(self):
+        task_progress.refresh_display(self)
+
+    def _refresh_progress_if_active(self, kind: str, row_key: str):
+        task_progress.refresh_if_active(self, kind, row_key)
+
+    def _finish_progress(self, kind: str, success: int, failed: int):
+        task_progress.finish(self, kind, success, failed)
+
+    def _set_progress_metrics(
+        self,
+        *,
+        balance_text: str | None = None,
+        amount_text: str | None = None,
+        gas_text: str | None = None,
+    ):
+        task_progress.set_metrics(self, balance_text=balance_text, amount_text=amount_text, gas_text=gas_text)
+
+    def _set_status(self, row_key: str, status: str):
+        self._ensure_query_status_store().pop(row_key, None)
+        self.row_status[row_key] = status
+        self._update_row_view(row_key)
+        self._refresh_progress_if_active("transfer", row_key)
+
+    def _set_query_status(self, row_key: str, status: str):
+        self._ensure_query_status_store()[row_key] = status
+        self._update_row_view(row_key)
+        self._refresh_progress_if_active("query", row_key)
+
+    def _set_query_statuses(self, row_keys: list[str], status: str):
+        for row_key in row_keys:
+            self._set_query_status(row_key, status)
 
     def _active_row_keys(self) -> list[str]:
         if self._is_mode_m2m():
@@ -396,10 +818,15 @@ class OnchainTransferPage:
         self.row_index_map = {}
         self.row_key_by_row_id = {}
         self.row_id_by_key = {}
+        self.draft_row_index_map = {}
 
         active = set(self._active_row_keys())
         self.checked_row_keys.intersection_update(active)
+        self._ensure_checked_m2m_draft_rows().intersection_update(set(range(len(self.m2m_import_drafts))))
         self.row_status = {k: v for k, v in self.row_status.items() if k in active}
+        self.row_status_context = {k: v for k, v in self.row_status_context.items() if k in active}
+        self.query_row_status = {k: v for k, v in self._ensure_query_status_store().items() if k in active}
+        self.query_row_status_context = {k: v for k, v in self.query_row_status_context.items() if k in active}
 
         mode = self._mode()
         if mode == self.MODE_M2M:
@@ -410,7 +837,7 @@ class OnchainTransferPage:
                 self.row_key_by_row_id[row_id] = key
                 self.row_id_by_key[key] = row_id
                 checked = "✓" if key in self.checked_row_keys else ""
-                st = self.row_status.get(key, "")
+                st = self._display_status(key)
                 tag = self._status_tag(st)
                 self.tree.insert(
                     "",
@@ -419,14 +846,34 @@ class OnchainTransferPage:
                     values=(
                         checked,
                         i,
-                        self._mask_credential(item.source),
-                        self._source_addr_text(item.source),
+                        self._display_credential(item.source),
                         item.target,
                         self._status_text(st),
                         self._balance_text_for_source(item.source),
                     ),
                     tags=(tag,) if tag else (),
                 )
+            start_index = len(self.store.multi_to_multi_pairs) + 1
+            for i, row in enumerate(self.m2m_import_drafts, start=start_index):
+                row_id = f"onchain_draft_{i}"
+                self.draft_row_index_map[row_id] = i - start_index
+                draft_idx = i - start_index
+                self.tree.insert(
+                    "",
+                    END,
+                    iid=row_id,
+                    values=(
+                        "✓" if draft_idx in self._ensure_checked_m2m_draft_rows() else "",
+                        i,
+                        self._display_credential(row.get("source", "")),
+                        row.get("target", "") or "-",
+                        "待补齐",
+                        "-",
+                    ),
+                    tags=("st_incomplete",),
+                )
+            self._apply_import_target_view()
+            self._update_empty_hint()
             return
 
         if mode == self.MODE_1M:
@@ -438,7 +885,7 @@ class OnchainTransferPage:
                 self.row_key_by_row_id[row_id] = key
                 self.row_id_by_key[key] = row_id
                 checked = "✓" if key in self.checked_row_keys else ""
-                st = self.row_status.get(key, "")
+                st = self._display_status(key)
                 tag = self._status_tag(st)
                 self.tree.insert(
                     "",
@@ -447,14 +894,15 @@ class OnchainTransferPage:
                     values=(
                         checked,
                         i,
-                        self._mask_credential(source) if source else "-",
-                        self._source_addr_text(source) if source else "-",
+                        self._display_credential(source),
                         target,
                         self._status_text(st),
                         self._balance_text_for_target(target),
-                    ),
-                    tags=(tag,) if tag else (),
-                )
+                ),
+                tags=(tag,) if tag else (),
+            )
+            self._apply_import_target_view()
+            self._update_empty_hint()
             return
 
         target = self.target_address_var.get().strip()
@@ -465,7 +913,7 @@ class OnchainTransferPage:
             self.row_key_by_row_id[row_id] = key
             self.row_id_by_key[key] = row_id
             checked = "✓" if key in self.checked_row_keys else ""
-            st = self.row_status.get(key, "")
+            st = self._display_status(key)
             tag = self._status_tag(st)
             self.tree.insert(
                 "",
@@ -474,14 +922,15 @@ class OnchainTransferPage:
                 values=(
                     checked,
                     i,
-                    self._mask_credential(source),
-                    self._source_addr_text(source),
+                    self._display_credential(source),
                     target if target else "-",
                     self._status_text(st),
                     self._balance_text_for_source(source),
                 ),
                 tags=(tag,) if tag else (),
             )
+        self._apply_import_target_view()
+        self._update_empty_hint()
 
     def _selected_indices(self) -> list[int]:
         idxs: list[int] = []
@@ -495,6 +944,19 @@ class OnchainTransferPage:
             return None
         row_id = self.tree.identify_row(event.y)
         if not row_id:
+            return None
+        draft_idx = getattr(self, "draft_row_index_map", {}).get(row_id)
+        if draft_idx is not None and self._is_mode_m2m():
+            checked_rows = self._ensure_checked_m2m_draft_rows()
+            checked = draft_idx not in checked_rows
+            if checked:
+                checked_rows.add(draft_idx)
+            else:
+                checked_rows.discard(draft_idx)
+            values = list(self.tree.item(row_id, "values"))
+            if values:
+                values[0] = "✓" if checked else ""
+                self.tree.item(row_id, values=values)
             return None
         key = self.row_key_by_row_id.get(row_id, "")
         if not key:
@@ -583,8 +1045,16 @@ class OnchainTransferPage:
     def _on_amount_mode_changed(self, *_args):
         self._apply_amount_layout()
 
-    def _apply_setting_layout(self, compact: bool):
-        self._compact_mode = compact
+    @staticmethod
+    def _layout_mode_for_width(width: int) -> str:
+        if width < 1500:
+            return "medium"
+        return "wide"
+
+    def _apply_setting_layout(self, layout_mode: str):
+        if layout_mode not in {"wide", "medium", "narrow"}:
+            layout_mode = "wide"
+        self._layout_mode = layout_mode
         widgets = [
             self.lbl_mode,
             self.mode_box,
@@ -610,7 +1080,6 @@ class OnchainTransferPage:
             self.ent_target_address,
             self.lbl_target_balance_title,
             self.lbl_target_balance_val,
-            self.lbl_batch_hint,
         ]
         for w in widgets:
             w.grid_forget()
@@ -621,7 +1090,7 @@ class OnchainTransferPage:
         show_source = self._is_mode_1m()
         show_target = self._is_mode_m1()
 
-        if not compact:
+        if layout_mode == "wide":
             self.lbl_mode.grid(row=0, column=0, sticky=W)
             self.mode_box.grid(row=0, column=1, sticky=W, padx=(4, 10))
             self.lbl_network.grid(row=0, column=2, sticky=W)
@@ -657,73 +1126,135 @@ class OnchainTransferPage:
                 self.lbl_target_balance_val.grid(row=row, column=9, columnspan=2, sticky=W, padx=(4, 0), pady=(8, 0))
                 self.setting_frame.columnconfigure(1, weight=1)
                 row += 1
-
-            self.lbl_batch_hint.grid(row=row, column=0, columnspan=11, sticky=W, pady=(8, 0))
             return
 
-        self.lbl_mode.grid(row=0, column=0, sticky=W)
-        self.mode_box.grid(row=0, column=1, sticky="ew", padx=(4, 8))
-        self.lbl_network.grid(row=0, column=2, sticky=W)
-        self.network_box.grid(row=0, column=3, sticky="ew", padx=(4, 0))
+        if layout_mode == "medium":
+            self.lbl_mode.grid(row=0, column=0, sticky=W)
+            self.mode_box.grid(row=0, column=1, sticky="ew", padx=(4, 8))
+            self.lbl_network.grid(row=0, column=2, sticky=W)
+            self.network_box.grid(row=0, column=3, sticky="ew", padx=(4, 0))
 
-        self.lbl_coin.grid(row=1, column=0, sticky=W, pady=(8, 0))
-        self.coin_box.grid(row=1, column=1, sticky="ew", padx=(4, 8), pady=(8, 0))
-        self.lbl_amount.grid(row=1, column=2, sticky=W, pady=(8, 0))
-        self.amount_ctrl.grid(row=1, column=3, sticky=W, padx=(4, 0), pady=(8, 0))
+            self.lbl_coin.grid(row=1, column=0, sticky=W, pady=(8, 0))
+            self.coin_box.grid(row=1, column=1, sticky="ew", padx=(4, 8), pady=(8, 0))
+            self.lbl_amount.grid(row=1, column=2, sticky=W, pady=(8, 0))
+            self.amount_ctrl.grid(row=1, column=3, sticky=W, padx=(4, 0), pady=(8, 0))
 
-        self.lbl_contract_search.grid(row=2, column=0, sticky=W, pady=(8, 0))
-        self.ent_contract_search.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=(8, 0))
-        self.btn_contract_search.grid(row=2, column=3, sticky=W, pady=(8, 0))
+            self.lbl_contract_search.grid(row=2, column=0, sticky=W, pady=(8, 0))
+            self.ent_contract_search.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=(8, 0))
+            self.btn_contract_search.grid(row=2, column=3, sticky=W, pady=(8, 0))
 
-        self.lbl_delay.grid(row=3, column=0, sticky=W, pady=(8, 0))
-        self.ent_delay.grid(row=3, column=1, sticky="ew", padx=(4, 8), pady=(8, 0))
-        self.lbl_threads.grid(row=3, column=2, sticky=W, pady=(8, 0))
-        self.spin_threads.grid(row=3, column=3, sticky="ew", padx=(4, 0), pady=(8, 0))
+            self.lbl_delay.grid(row=3, column=0, sticky=W, pady=(8, 0))
+            self.ent_delay.grid(row=3, column=1, sticky="ew", padx=(4, 8), pady=(8, 0))
+            self.lbl_threads.grid(row=3, column=2, sticky=W, pady=(8, 0))
+            self.spin_threads.grid(row=3, column=3, sticky="ew", padx=(4, 0), pady=(8, 0))
 
-        self.chk_dry_run.grid(row=4, column=0, sticky=W, pady=(8, 0))
-        row = 5
+            self.chk_dry_run.grid(row=4, column=0, sticky=W, pady=(8, 0))
+            row = 5
+
+            if show_source:
+                self.lbl_source_credential.grid(row=row, column=0, sticky=W, pady=(8, 0))
+                self.ent_source_credential.grid(row=row, column=1, columnspan=3, sticky="ew", padx=(4, 0), pady=(8, 0))
+                self.lbl_source_balance_title.grid(row=row + 1, column=0, sticky=W, pady=(6, 0))
+                self.lbl_source_balance_val.grid(row=row + 1, column=1, columnspan=3, sticky=W, padx=(4, 0), pady=(6, 0))
+                row += 2
+
+            if show_target:
+                self.lbl_target_address.grid(row=row, column=0, sticky=W, pady=(8, 0))
+                self.ent_target_address.grid(row=row, column=1, columnspan=3, sticky="ew", padx=(4, 0), pady=(8, 0))
+                self.lbl_target_balance_title.grid(row=row + 1, column=0, sticky=W, pady=(6, 0))
+                self.lbl_target_balance_val.grid(row=row + 1, column=1, columnspan=3, sticky=W, padx=(4, 0), pady=(6, 0))
+
+            self.setting_frame.columnconfigure(1, weight=1)
+            self.setting_frame.columnconfigure(2, weight=0)
+            self.setting_frame.columnconfigure(3, weight=1)
+            return
+
+        row = 0
+        self.lbl_mode.grid(row=row, column=0, sticky=W)
+        self.mode_box.grid(row=row, column=1, sticky="ew", padx=(4, 0))
+        row += 1
+
+        self.lbl_network.grid(row=row, column=0, sticky=W, pady=(8, 0))
+        self.network_box.grid(row=row, column=1, sticky="ew", padx=(4, 0), pady=(8, 0))
+        row += 1
+
+        self.lbl_coin.grid(row=row, column=0, sticky=W, pady=(8, 0))
+        self.coin_box.grid(row=row, column=1, sticky="ew", padx=(4, 0), pady=(8, 0))
+        row += 1
+
+        self.lbl_amount.grid(row=row, column=0, sticky=W, pady=(8, 0))
+        self.amount_ctrl.grid(row=row, column=1, sticky=W, padx=(4, 0), pady=(8, 0))
+        row += 1
+
+        self.lbl_contract_search.grid(row=row, column=0, sticky=W, pady=(8, 0))
+        self.ent_contract_search.grid(row=row, column=1, sticky="ew", padx=(4, 0), pady=(8, 0))
+        row += 1
+        self.btn_contract_search.grid(row=row, column=1, sticky=W, pady=(6, 0))
+        row += 1
+
+        self.lbl_delay.grid(row=row, column=0, sticky=W, pady=(8, 0))
+        self.ent_delay.grid(row=row, column=1, sticky="ew", padx=(4, 0), pady=(8, 0))
+        row += 1
+
+        self.lbl_threads.grid(row=row, column=0, sticky=W, pady=(8, 0))
+        self.spin_threads.grid(row=row, column=1, sticky="ew", padx=(4, 0), pady=(8, 0))
+        row += 1
+
+        self.chk_dry_run.grid(row=row, column=0, columnspan=2, sticky=W, pady=(8, 0))
+        row += 1
 
         if show_source:
             self.lbl_source_credential.grid(row=row, column=0, sticky=W, pady=(8, 0))
-            self.ent_source_credential.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=(8, 0))
-            self.lbl_source_balance_title.grid(row=row, column=3, sticky=W, pady=(8, 0))
-            self.lbl_source_balance_val.grid(row=row + 1, column=1, columnspan=3, sticky=W, padx=(4, 0))
-            row += 2
+            self.ent_source_credential.grid(row=row + 1, column=0, columnspan=2, sticky="ew", padx=(0, 0), pady=(4, 0))
+            self.lbl_source_balance_title.grid(row=row + 2, column=0, sticky=W, pady=(6, 0))
+            self.lbl_source_balance_val.grid(row=row + 2, column=1, sticky=W, padx=(4, 0), pady=(6, 0))
+            row += 3
 
         if show_target:
             self.lbl_target_address.grid(row=row, column=0, sticky=W, pady=(8, 0))
-            self.ent_target_address.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(4, 8), pady=(8, 0))
-            self.lbl_target_balance_title.grid(row=row, column=3, sticky=W, pady=(8, 0))
-            self.lbl_target_balance_val.grid(row=row + 1, column=1, columnspan=3, sticky=W, padx=(4, 0))
-            row += 2
+            self.ent_target_address.grid(row=row + 1, column=0, columnspan=2, sticky="ew", padx=(0, 0), pady=(4, 0))
+            self.lbl_target_balance_title.grid(row=row + 2, column=0, sticky=W, pady=(6, 0))
+            self.lbl_target_balance_val.grid(row=row + 2, column=1, sticky=W, padx=(4, 0), pady=(6, 0))
 
-        self.lbl_batch_hint.grid(row=row, column=0, columnspan=4, sticky=W, pady=(8, 0))
+        self.setting_frame.columnconfigure(0, weight=0)
         self.setting_frame.columnconfigure(1, weight=1)
-        self.setting_frame.columnconfigure(2, weight=1)
-        self.setting_frame.columnconfigure(3, weight=1)
 
     def _on_root_resize(self, _event=None):
         width = self.root.winfo_width()
-        compact = width < 1220
-        if compact != self._compact_mode:
-            self._apply_setting_layout(compact=compact)
+        layout_mode = self._layout_mode_for_width(width)
+        if layout_mode != self._layout_mode:
+            self._apply_setting_layout(layout_mode)
         self._resize_tree_columns()
         self._on_log_resize()
 
     def _on_table_resize(self, _event=None):
         self._resize_tree_columns()
+        self._apply_import_target_view()
+        self._update_empty_hint()
 
     def _resize_tree_columns(self):
         if not hasattr(self, "tree"):
             return
-        cols = ("checked", "idx", "source", "source_addr", "target", "status", "balance")
-        min_widths = self.TREE_COL_MIN_WIDTHS
-        total_min = sum(min_widths[c] for c in cols)
+        cols = ("checked", "idx", "source", "target", "status", "balance")
         width = self.tree.winfo_width()
         if width <= 1 and hasattr(self, "table_wrap"):
             width = self.table_wrap.winfo_width() - 20
         if width <= 0:
             return
+
+        min_widths = dict(self.TREE_COL_MIN_WIDTHS)
+        weights = dict(self.TREE_COL_WEIGHTS)
+        if width < 820:
+            min_widths.update({"source": 150, "target": 220, "status": 84, "balance": 68})
+            weights.update({"source": 3, "target": 6, "status": 2, "balance": 1})
+        elif width < 980:
+            min_widths.update({"source": 170, "target": 250, "status": 86, "balance": 72})
+            weights.update({"source": 3, "target": 6, "status": 2, "balance": 1})
+        elif width < 1220:
+            min_widths.update({"source": 210, "target": 300, "status": 90, "balance": 76})
+            weights.update({"source": 4, "target": 6, "status": 2, "balance": 1})
+
+        total_min = sum(min_widths[c] for c in cols)
 
         if width <= total_min:
             for c in cols:
@@ -731,7 +1262,6 @@ class OnchainTransferPage:
             return
 
         extra = width - total_min
-        weights = self.TREE_COL_WEIGHTS
         total_weight = sum(weights[c] for c in cols)
         used = 0
         for i, c in enumerate(cols):
@@ -753,24 +1283,23 @@ class OnchainTransferPage:
 
     def _on_mode_changed(self, *_args):
         mode = self._mode()
+        self._set_import_target("full")
         if mode == self.MODE_M2M:
-            hint = "提示：每行格式：私钥或助记词 + 接收地址（地址放在最后一列）"
             self.source_balance_var.set("-")
             self.target_balance_var.set("-")
         elif mode == self.MODE_1M:
-            hint = "提示：1对多只需导入接收地址；转出钱包私钥/助记词在上方填写"
             source = self.source_credential_var.get().strip()
             self.source_balance_var.set(self._balance_text_for_source(source) if source else "-")
             self.target_balance_var.set("-")
         else:
-            hint = "提示：多对1请先填写收款地址，再导入多个私钥/助记词"
             self.source_balance_var.set("-")
             target = self.target_address_var.get().strip()
             self.target_balance_var.set(self._balance_text_for_target(target) if target else "-")
-        self.import_hint_label.configure(text=hint)
-        self._apply_setting_layout(compact=bool(self._compact_mode))
+        width = self.root.winfo_width() if hasattr(self, "root") and hasattr(self.root, "winfo_width") else 1500
+        self._apply_setting_layout(self._layout_mode_for_width(width))
         self._refresh_tree()
         self._resize_tree_columns()
+        self._update_empty_hint()
 
     def _on_network_changed(self, *_args):
         network = self.network_var.get().strip().upper()
@@ -807,19 +1336,26 @@ class OnchainTransferPage:
             bal = self._balance_text_for_source(source) if source else "-"
             self.source_balance_var.set(bal)
             self.target_balance_var.set("-")
+            if not self.is_running:
+                task_progress.reset_metrics(self, amount_label="转账总额")
             self._refresh_tree()
             return
         self.source_balance_var.set("-")
         if self._is_mode_m1():
             target = self.target_address_var.get().strip()
             self.target_balance_var.set(self._balance_text_for_target(target) if target else "-")
+            if not self.is_running:
+                task_progress.reset_metrics(self, amount_label="转账总额")
             self._refresh_tree()
             return
         self.target_balance_var.set("-")
 
     def _update_balance_heading(self):
         symbol = self.symbol_var.get().strip() or "-"
-        self.tree.heading("balance", text=f"余额({symbol})")
+        text = f"余额({symbol})"
+        self._tree_heading_base_texts["balance"] = text
+        self.tree.heading("balance", text=text)
+        self._apply_import_target_view()
 
     @staticmethod
     def _short_contract(contract: str) -> str:
@@ -968,8 +1504,7 @@ class OnchainTransferPage:
                 target = arr[-1].strip()
             if not source:
                 raise RuntimeError(f"第 {i} 行格式错误：私钥/助记词不能为空")
-            if not self.client.is_address(target):
-                raise RuntimeError(f"第 {i} 行地址格式错误：{target}")
+            target = self._validate_recipient_address(target, f"第 {i} 行接收地址")
             key = (source, target)
             if key in seen:
                 continue
@@ -984,8 +1519,7 @@ class OnchainTransferPage:
             s = line.strip()
             if not s or s.startswith("#"):
                 continue
-            if not self.client.is_address(s):
-                raise RuntimeError(f"第 {i} 行地址格式错误：{s}")
+            s = self._validate_recipient_address(s, f"第 {i} 行接收地址")
             if s in seen:
                 continue
             seen.add(s)
@@ -1039,6 +1573,10 @@ class OnchainTransferPage:
         try:
             lines = text.splitlines()
             mode = self._mode()
+            target = self._current_import_target()
+            if mode == self.MODE_M2M and target != "full":
+                self._import_m2m_column(target, lines, "剪贴板")
+                return
             if mode == self.MODE_M2M:
                 rows = self._parse_m2m_lines(lines)
             elif mode == self.MODE_1M:
@@ -1094,41 +1632,66 @@ class OnchainTransferPage:
 
     def toggle_check_all(self):
         keys = set(self._active_row_keys())
-        if not keys:
+        draft_rows = set(range(len(self.m2m_import_drafts))) if self._is_mode_m2m() else set()
+        checked_draft_rows = self._ensure_checked_m2m_draft_rows() if self._is_mode_m2m() else set()
+        if not keys and not draft_rows:
             messagebox.showwarning("提示", "当前模式暂无可操作数据")
             return
-        if self.checked_row_keys == keys:
+        if self.checked_row_keys == keys and checked_draft_rows == draft_rows:
             self.checked_row_keys.clear()
+            checked_draft_rows.clear()
             self.log("已取消全选")
         else:
             self.checked_row_keys = set(keys)
-            self.log(f"已全选 {len(keys)} 条")
+            checked_draft_rows.clear()
+            checked_draft_rows.update(draft_rows)
+            self.log(f"已全选 {len(keys) + len(draft_rows)} 条")
         self._refresh_tree()
 
     def delete_selected(self):
         mode = self._mode()
         if mode == self.MODE_M2M:
             idxs = [i for i, item in enumerate(self.store.multi_to_multi_pairs) if self._m2m_key(item) in self.checked_row_keys]
+            draft_idxs = sorted(self._ensure_checked_m2m_draft_rows())
         elif mode == self.MODE_1M:
             idxs = [i for i, target in enumerate(self.store.one_to_many_addresses) if self._one_to_many_key(target) in self.checked_row_keys]
+            draft_idxs = []
         else:
             idxs = [i for i, source in enumerate(self.store.many_to_one_sources) if self._many_to_one_key(source) in self.checked_row_keys]
-        if not idxs:
+            draft_idxs = []
+        if not idxs and not draft_idxs:
             messagebox.showwarning("提示", "请先勾选要删除的数据")
             return
-        if not messagebox.askyesno("确认删除", f"确认删除 {len(idxs)} 条数据吗？"):
+        total = len(idxs) + len(draft_idxs)
+        if not messagebox.askyesno("确认删除", f"确认删除 {total} 条数据吗？"):
             return
 
         if mode == self.MODE_M2M:
             self.store.delete_multi_to_multi_by_indices(idxs)
+            for draft_idx in sorted(draft_idxs, reverse=True):
+                if 0 <= draft_idx < len(self.m2m_import_drafts):
+                    self.m2m_import_drafts.pop(draft_idx)
+            self._ensure_checked_m2m_draft_rows().clear()
         elif mode == self.MODE_1M:
             self.store.delete_one_to_many_by_indices(idxs)
         else:
             self.store.delete_many_to_one_by_indices(idxs)
         self._refresh_tree()
-        self.log(f"已删除 {len(idxs)} 条")
+        self.log(f"已删除 {total} 条")
 
     def delete_current_row(self):
+        draft_idx = self._selected_draft_index()
+        if draft_idx is not None and self._is_mode_m2m():
+            if not (0 <= draft_idx < len(self.m2m_import_drafts)):
+                messagebox.showwarning("提示", "请先右键选中一条数据")
+                return
+            if not messagebox.askyesno("确认删除", "确认删除当前待补齐数据吗？"):
+                return
+            self.m2m_import_drafts.pop(draft_idx)
+            self._ensure_checked_m2m_draft_rows().clear()
+            self._refresh_tree()
+            self.log("已删除当前待补齐数据")
+            return
         idx = self._single_selected_index()
         if idx is None:
             messagebox.showwarning("提示", "请先右键选中一条数据")
@@ -1162,6 +1725,35 @@ class OnchainTransferPage:
         amount = self.amount_var.get().strip()
         if amount_mode == self.AMOUNT_MODE_ALL:
             amount = self.AMOUNT_ALL_LABEL
+        elif amount_mode == self.AMOUNT_MODE_FIXED:
+            if not amount:
+                messagebox.showerror("参数错误", "转账数量不能为空")
+                return False
+            try:
+                amount_value = Decimal(amount)
+                if amount_value <= 0:
+                    raise InvalidOperation
+                amount = self._decimal_to_text(amount_value)
+            except Exception:
+                messagebox.showerror("参数错误", "固定数量必须是大于 0 的数字")
+                return False
+        random_min = self.random_min_var.get().strip()
+        random_max = self.random_max_var.get().strip()
+        if amount_mode == self.AMOUNT_MODE_RANDOM:
+            try:
+                random_min_value = Decimal(random_min)
+                random_max_value = Decimal(random_max)
+            except Exception:
+                messagebox.showerror("参数错误", "随机金额最小值/最大值格式错误")
+                return False
+            if random_min_value <= 0 or random_max_value <= 0:
+                messagebox.showerror("参数错误", "随机金额最小值和最大值必须大于 0")
+                return False
+            if random_max_value < random_min_value:
+                messagebox.showerror("参数错误", "随机金额最大值必须大于或等于最小值")
+                return False
+            random_min = self._decimal_to_text(random_min_value)
+            random_max = self._decimal_to_text(random_max_value)
         try:
             delay = max(0.0, float(self.delay_var.get()))
         except Exception:
@@ -1180,17 +1772,32 @@ class OnchainTransferPage:
             token_contract=(token.contract if token else ""),
             amount_mode=amount_mode,
             amount=amount,
-            random_min=self.random_min_var.get().strip(),
-            random_max=self.random_max_var.get().strip(),
+            random_min=random_min,
+            random_max=random_max,
             delay_seconds=delay,
             worker_threads=threads,
             dry_run=bool(self.dry_run_var.get()),
             one_to_many_source=self.source_credential_var.get().strip(),
-            many_to_one_target=self.target_address_var.get().strip(),
+            many_to_one_target="",
         )
+        target = self.target_address_var.get().strip()
+        if target:
+            try:
+                safe_target = self._validate_recipient_address(target, "收款地址")
+            except Exception as exc:
+                messagebox.showerror("参数错误", str(exc))
+                return False
+            self.target_address_var.set(safe_target)
+            self.store.settings.many_to_one_target = safe_target
         return True
 
     def save_all(self):
+        draft_count = len(self.m2m_import_drafts)
+        if draft_count and not messagebox.askyesno(
+            "未补齐提示",
+            f"当前有 {draft_count} 行待补齐数据，保存时只会写入已补齐数据，确认继续？",
+        ):
+            return
         if not self._apply_settings_to_store():
             return
         try:
@@ -1222,7 +1829,12 @@ class OnchainTransferPage:
             self.threads_var.set(str(max(1, int(st.worker_threads or 1))))
             self.dry_run_var.set(st.dry_run)
             self.source_credential_var.set(st.one_to_many_source or "")
-            self.target_address_var.set(st.many_to_one_target or "")
+            loaded_target = st.many_to_one_target or ""
+            try:
+                loaded_target = self._try_validate_recipient_address(loaded_target, "收款地址") or loaded_target
+            except Exception:
+                pass
+            self.target_address_var.set(loaded_target)
             self.contract_search_var.set(st.token_contract or "")
             self.source_balance_var.set("-")
             self.target_balance_var.set("-")
@@ -1241,7 +1853,13 @@ class OnchainTransferPage:
             for item in self.store.multi_to_multi_pairs:
                 key = self._m2m_key(item)
                 if key in self.checked_row_keys:
-                    jobs.append((key, item.source, item.target))
+                    try:
+                        target = self._validate_recipient_address(item.target, "接收地址")
+                    except Exception as exc:
+                        if with_message:
+                            messagebox.showerror("参数错误", str(exc))
+                        return []
+                    jobs.append((key, item.source, target))
         elif mode == self.MODE_1M:
             source = self.source_credential_var.get().strip()
             if not source:
@@ -1251,17 +1869,26 @@ class OnchainTransferPage:
             for target in self.store.one_to_many_addresses:
                 key = self._one_to_many_key(target)
                 if key in self.checked_row_keys:
-                    jobs.append((key, source, target))
+                    try:
+                        safe_target = self._validate_recipient_address(target, "接收地址")
+                    except Exception as exc:
+                        if with_message:
+                            messagebox.showerror("参数错误", str(exc))
+                        return []
+                    jobs.append((key, source, safe_target))
         else:
             target = self.target_address_var.get().strip()
             if not target:
                 if with_message:
                     messagebox.showerror("参数错误", "多对1模式请填写收款地址")
                 return []
-            if not self.client.is_address(target):
+            try:
+                target = self._validate_recipient_address(target, "收款地址")
+            except Exception as exc:
                 if with_message:
-                    messagebox.showerror("参数错误", "收款地址格式错误")
+                    messagebox.showerror("参数错误", str(exc))
                 return []
+            self.target_address_var.set(target)
             for source in self.store.many_to_one_sources:
                 key = self._many_to_one_key(source)
                 if key in self.checked_row_keys:
@@ -1278,8 +1905,14 @@ class OnchainTransferPage:
         if mode == self.MODE_M2M:
             for item in self.store.multi_to_multi_pairs:
                 key = self._m2m_key(item)
-                if self.row_status.get(key, "") == "failed":
-                    jobs.append((key, item.source, item.target))
+                if self._display_status(key) == "failed":
+                    try:
+                        target = self._validate_recipient_address(item.target, "接收地址")
+                    except Exception as exc:
+                        if with_message:
+                            messagebox.showerror("参数错误", str(exc))
+                        return []
+                    jobs.append((key, item.source, target))
         elif mode == self.MODE_1M:
             source = self.source_credential_var.get().strip()
             if not source:
@@ -1288,26 +1921,41 @@ class OnchainTransferPage:
                 return []
             for target in self.store.one_to_many_addresses:
                 key = self._one_to_many_key(target)
-                if self.row_status.get(key, "") == "failed":
-                    jobs.append((key, source, target))
+                if self._display_status(key) == "failed":
+                    try:
+                        safe_target = self._validate_recipient_address(target, "接收地址")
+                    except Exception as exc:
+                        if with_message:
+                            messagebox.showerror("参数错误", str(exc))
+                        return []
+                    jobs.append((key, source, safe_target))
         else:
             target = self.target_address_var.get().strip()
             if not target:
                 if with_message:
                     messagebox.showerror("参数错误", "多对1模式请填写收款地址")
                 return []
-            if not self.client.is_address(target):
+            try:
+                target = self._validate_recipient_address(target, "收款地址")
+            except Exception as exc:
                 if with_message:
-                    messagebox.showerror("参数错误", "收款地址格式错误")
+                    messagebox.showerror("参数错误", str(exc))
                 return []
+            self.target_address_var.set(target)
             for source in self.store.many_to_one_sources:
                 key = self._many_to_one_key(source)
-                if self.row_status.get(key, "") == "failed":
+                if self._display_status(key) == "failed":
                     jobs.append((key, source, target))
 
         if with_message and not jobs:
-            messagebox.showwarning("提示", "当前没有失败记录可重试")
+            tip = "当前没有失败记录可重试"
+            if self._has_submitted_jobs():
+                tip = "当前没有失败记录可重试，存在确认中的记录，请等待自动确认完成"
+            messagebox.showwarning("提示", tip)
         return jobs
+
+    def _has_submitted_jobs(self) -> bool:
+        return any(self._display_status(row_key) == "submitted" for row_key in self._active_row_keys())
 
     @classmethod
     def _random_decimal_between(cls, low: Decimal, high: Decimal) -> Decimal:
@@ -1385,6 +2033,18 @@ class OnchainTransferPage:
             messagebox.showerror("参数错误", "执行线程数格式错误")
             return None
 
+        if hasattr(self, "mode_var") and self._is_mode_m1():
+            target = self.target_address_var.get().strip()
+            if not target:
+                messagebox.showerror("参数错误", "多对1模式请填写收款地址")
+                return None
+            try:
+                safe_target = self._validate_recipient_address(target, "收款地址")
+            except Exception as exc:
+                messagebox.showerror("参数错误", str(exc))
+                return None
+            self.target_address_var.set(safe_target)
+
         return WithdrawRuntimeParams(
             coin=coin,
             amount=amount,
@@ -1448,6 +2108,8 @@ class OnchainTransferPage:
                 if not targets:
                     messagebox.showwarning("提示", "请先勾选至少一条查询数据")
                     return
+                self._mark_query_status_contexts([self._one_to_many_key(t) for t in targets], source)
+                self._set_query_statuses([self._one_to_many_key(t) for t in targets], "waiting")
                 self.is_running = True
                 threading.Thread(
                     target=self._run_query_balance_one_to_many,
@@ -1458,9 +2120,13 @@ class OnchainTransferPage:
 
             if mode == self.MODE_M1:
                 target = self.target_address_var.get().strip()
-                if target and not self.client.is_address(target):
-                    self.log("收款地址格式错误，已跳过收款地址余额查询")
-                    target = ""
+                if target:
+                    try:
+                        target = self._validate_recipient_address(target, "收款地址")
+                        self.target_address_var.set(target)
+                    except Exception as exc:
+                        self.log(f"{exc}，已跳过收款地址余额查询")
+                        target = ""
                 selected_sources = [s for s in self.store.many_to_one_sources if self._many_to_one_key(s) in self.checked_row_keys]
                 sources: list[str] = []
                 seen_s: set[str] = set()
@@ -1473,6 +2139,9 @@ class OnchainTransferPage:
                 if not sources:
                     messagebox.showwarning("提示", "请先勾选至少一条查询数据")
                     return
+                target_context = self._normalize_context_target(target) if target else ""
+                self._mark_query_status_contexts([self._many_to_one_key(s) for s in sources], target_context)
+                self._set_query_statuses([self._many_to_one_key(s) for s in sources], "waiting")
                 self.is_running = True
                 threading.Thread(
                     target=self._run_query_balance_many_to_one,
@@ -1484,16 +2153,22 @@ class OnchainTransferPage:
             selected_pairs = [x for x in self.store.multi_to_multi_pairs if self._m2m_key(x) in self.checked_row_keys]
             sources: list[str] = []
             seen: set[str] = set()
+            row_keys_by_source: dict[str, list[str]] = {}
             for item in selected_pairs:
                 s = item.source.strip()
                 if not s or s in seen:
+                    if s:
+                        row_keys_by_source.setdefault(s, []).append(self._m2m_key(item))
                     continue
                 seen.add(s)
                 sources.append(s)
+                row_keys_by_source[s] = [self._m2m_key(item)]
             if not sources:
                 messagebox.showwarning("提示", "请先勾选至少一条查询数据")
                 return
 
+            self._query_row_keys_by_source = {k: list(v) for k, v in row_keys_by_source.items()}
+            self._set_query_statuses([key for keys in row_keys_by_source.values() for key in keys], "waiting")
             self.is_running = True
             threading.Thread(target=self._run_query_balance_for_sources, args=(network, token, sources), daemon=True).start()
         except Exception as exc:
@@ -1517,14 +2192,23 @@ class OnchainTransferPage:
             token = self._selected_token(with_message=True)
             if not token:
                 return
+            if self._warn_if_draft_selected():
+                return
             job = self._single_row_job()
             if not job:
                 messagebox.showwarning("提示", "请先右键选中一条数据")
                 return
             _row_key, source, target = job
             mode = self._mode()
-            self.is_running = True
             if mode == self.MODE_1M:
+                try:
+                    target = self._validate_recipient_address(target, "接收地址")
+                except Exception as exc:
+                    messagebox.showerror("参数错误", str(exc))
+                    return
+                self.is_running = True
+                self._mark_query_status_context(self._one_to_many_key(target), source)
+                self._set_query_status(self._one_to_many_key(target), "waiting")
                 threading.Thread(
                     target=self._run_query_balance_one_to_many,
                     args=(network, token, source, [target]),
@@ -1533,15 +2217,25 @@ class OnchainTransferPage:
                 return
             if mode == self.MODE_M1:
                 target_addr = target
-                if target_addr and not self.client.is_address(target_addr):
-                    self.log("收款地址格式错误，已跳过收款地址余额查询")
-                    target_addr = ""
+                if target_addr:
+                    try:
+                        target_addr = self._validate_recipient_address(target_addr, "收款地址")
+                        self.target_address_var.set(target_addr)
+                    except Exception as exc:
+                        self.log(f"{exc}，已跳过收款地址余额查询")
+                        target_addr = ""
+                self.is_running = True
+                self._mark_query_status_context(self._many_to_one_key(source), self._normalize_context_target(target_addr))
+                self._set_query_status(self._many_to_one_key(source), "waiting")
                 threading.Thread(
                     target=self._run_query_balance_many_to_one,
                     args=(network, token, target_addr, [source]),
                     daemon=True,
                 ).start()
                 return
+            self._query_row_keys_by_source = {source: [_row_key]}
+            self._set_query_status(_row_key, "waiting")
+            self.is_running = True
             threading.Thread(
                 target=self._run_query_balance_for_sources,
                 args=(network, token, [source]),
@@ -1559,6 +2253,8 @@ class OnchainTransferPage:
             params = self._validate_transfer_params()
             if not params:
                 return
+            if self._warn_if_draft_selected():
+                return
             job = self._single_row_job()
             if not job:
                 messagebox.showwarning("提示", "请先右键选中一条数据")
@@ -1568,13 +2264,22 @@ class OnchainTransferPage:
             if mode == self.MODE_1M and not source:
                 messagebox.showerror("参数错误", "1对多模式请填写转出钱包私钥/助记词")
                 return
+            if mode in {self.MODE_M2M, self.MODE_1M}:
+                try:
+                    target = self._validate_recipient_address(target, "接收地址")
+                except Exception as exc:
+                    messagebox.showerror("参数错误", str(exc))
+                    return
             if mode == self.MODE_M1:
                 if not target:
                     messagebox.showerror("参数错误", "多对1模式请填写收款地址")
                     return
-                if not self.client.is_address(target):
-                    messagebox.showerror("参数错误", "收款地址格式错误")
+                try:
+                    target = self._validate_recipient_address(target, "收款地址")
+                except Exception as exc:
+                    messagebox.showerror("参数错误", str(exc))
                     return
+                self.target_address_var.set(target)
 
             dry_run = bool(self.dry_run_var.get())
             if not dry_run:
@@ -1614,6 +2319,20 @@ class OnchainTransferPage:
         try:
             symbol = token.symbol
             token_desc = symbol if token.is_native else f"{symbol}({self._short_contract(token.contract)})"
+            row_keys_by_source = {k: list(v) for k, v in getattr(self, "_query_row_keys_by_source", {}).items()}
+            if not row_keys_by_source:
+                row_keys_by_source = {}
+                for item in getattr(self.store, "multi_to_multi_pairs", []):
+                    src = item.source.strip()
+                    if src in sources:
+                        row_keys_by_source.setdefault(src, []).append(self._m2m_key(item))
+            progress_keys = self._unique_row_keys([key for src in sources for key in row_keys_by_source.get(src, [])])
+            self.root.after(0, lambda keys=progress_keys: self._begin_progress("query", keys))
+            self.root.after(0, lambda a=self._token_amount_text(symbol, Decimal("0")): self._set_progress_metrics(balance_text=a))
+            self.root.after(
+                0,
+                lambda keys=[key for src in sources for key in row_keys_by_source.get(src, [])]: self._set_query_statuses(keys, "waiting"),
+            )
             self.root.after(0, lambda: self.log(f"开始查询余额：网络={network}，币种={token_desc}，钱包数={len(sources)}"))
             ok = 0
             failed = 0
@@ -1630,7 +2349,9 @@ class OnchainTransferPage:
                         i, source = jobs.get_nowait()
                     except queue.Empty:
                         return
+                    row_keys = list(row_keys_by_source.get(source, []))
                     prefix = f"[{i}/{len(sources)}]"
+                    self.root.after(0, lambda keys=row_keys: self._set_query_statuses(keys, "running"))
                     try:
                         _pk, addr = self._resolve_wallet(source)
                         if token.is_native:
@@ -1642,12 +2363,16 @@ class OnchainTransferPage:
                             self.source_balance_cache[source] = amount
                             total += amount
                             ok += 1
+                            balance_total_text = self._token_amount_text(symbol, total)
                         msg = f"{prefix}[{self._mask(addr, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(amount)}"
                         self.root.after(0, lambda m=msg: self.log(m))
+                        self.root.after(0, lambda a=balance_total_text: self._set_progress_metrics(balance_text=a))
+                        self.root.after(0, lambda keys=row_keys: self._set_query_statuses(keys, "success"))
                     except Exception as exc:
                         with lock:
                             failed += 1
                         self.root.after(0, lambda m=f"{prefix} 查询失败：{exc}": self.log(m))
+                        self.root.after(0, lambda keys=row_keys: self._set_query_statuses(keys, "failed"))
                     finally:
                         jobs.task_done()
 
@@ -1662,11 +2387,14 @@ class OnchainTransferPage:
             summary = f"余额查询结束：成功 {ok}，失败 {failed}，{symbol} 合计={self._decimal_to_text(total)}"
             self.root.after(0, lambda: self._refresh_tree())
             self.root.after(0, lambda: self.log(summary))
+            self.root.after(0, lambda s=ok, f=failed: self._finish_progress("query", s, f))
         except Exception as exc:
             err_text = str(exc)
             self.root.after(0, lambda m=f"余额查询任务异常终止：{err_text}": self.log(m))
             self.root.after(0, lambda e=err_text: messagebox.showerror("执行异常", e))
+            self.root.after(0, lambda s=ok if "ok" in locals() else 0, f=failed if "failed" in locals() else 0: self._finish_progress("query", s, f))
         finally:
+            self._query_row_keys_by_source = {}
             self.is_running = False
 
     def _run_query_balance_one_to_many(self, network: str, token: EvmToken, source: str, targets: list[str]):
@@ -1674,6 +2402,12 @@ class OnchainTransferPage:
             symbol = token.symbol
             token_desc = self._token_desc(token)
             src_count = 1 if source else 0
+            context_sig = source.strip()
+            row_keys_by_target = {target: self._one_to_many_key(target) for target in targets}
+            self._mark_query_status_contexts(list(row_keys_by_target.values()), context_sig)
+            self.root.after(0, lambda keys=self._unique_row_keys(list(row_keys_by_target.values())): self._begin_progress("query", keys))
+            self.root.after(0, lambda a=self._token_amount_text(symbol, Decimal("0")): self._set_progress_metrics(balance_text=a))
+            self.root.after(0, lambda keys=list(row_keys_by_target.values()): self._set_query_statuses(keys, "waiting"))
             self.root.after(
                 0,
                 lambda: self.log(f"开始查询余额：模式=1对多，网络={network}，币种={token_desc}，源钱包数={src_count}，目标地址数={len(targets)}"),
@@ -1691,15 +2425,17 @@ class OnchainTransferPage:
                         src_units = self.client.get_erc20_balance(network, token.contract, source_addr)
                     src_amount = self._units_to_amount(src_units, token.decimals)
                     self.source_balance_cache[source] = src_amount
-                    src_text = f"{symbol}:{self._decimal_to_text(src_amount)}"
-                    self.root.after(0, lambda t=src_text: self.source_balance_var.set(t))
+                    if context_sig == self.source_credential_var.get().strip():
+                        src_text = f"{symbol}:{self._decimal_to_text(src_amount)}"
+                        self.root.after(0, lambda t=src_text: self.source_balance_var.set(t))
                     self.root.after(
                         0,
                         lambda m=f"[SRC][{self._mask(source_addr, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(src_amount)}": self.log(m),
                     )
                     source_query_state = "ok"
                 except Exception as exc:
-                    self.root.after(0, lambda: self.source_balance_var.set("-"))
+                    if context_sig == self.source_credential_var.get().strip():
+                        self.root.after(0, lambda: self.source_balance_var.set("-"))
                     self.root.after(0, lambda m=f"[SRC] 查询失败：{exc}": self.log(m))
                     source_query_state = "failed"
             else:
@@ -1709,24 +2445,60 @@ class OnchainTransferPage:
             ok = 0
             failed = 0
             total = Decimal("0")
+            lock = threading.Lock()
+            jobs: queue.Queue[tuple[int, str]] = queue.Queue()
+            for i, addr in enumerate(targets, start=1):
+                jobs.put((i, addr))
             if not targets:
                 self.root.after(0, lambda: self.log("[DST] 未提供目标地址，已跳过目标地址余额查询"))
-            for i, addr in enumerate(targets, start=1):
-                prefix = f"[{i}/{len(targets)}]"
-                try:
-                    if token.is_native:
-                        units = self.client.get_balance_wei(network, addr)
-                    else:
-                        units = self.client.get_erc20_balance(network, token.contract, addr)
-                    amount = self._units_to_amount(units, token.decimals)
-                    self.target_balance_cache[addr] = amount
-                    total += amount
-                    msg = f"{prefix}[{self._mask(addr, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(amount)}"
-                    self.root.after(0, lambda m=msg: self.log(m))
-                    ok += 1
-                except Exception as exc:
-                    self.root.after(0, lambda m=f"{prefix} 查询失败：{exc}": self.log(m))
-                    failed += 1
+
+            def worker():
+                nonlocal ok, failed, total
+                while True:
+                    try:
+                        i, addr = jobs.get_nowait()
+                    except queue.Empty:
+                        return
+                    row_key = row_keys_by_target.get(addr, "")
+                    prefix = f"[{i}/{len(targets)}]"
+                    if row_key:
+                        self._mark_query_status_context(row_key, context_sig)
+                        self.root.after(0, lambda k=row_key: self._set_query_status(k, "running"))
+                    try:
+                        if token.is_native:
+                            units = self.client.get_balance_wei(network, addr)
+                        else:
+                            units = self.client.get_erc20_balance(network, token.contract, addr)
+                        amount = self._units_to_amount(units, token.decimals)
+                        with lock:
+                            self.target_balance_cache[addr] = amount
+                            total += amount
+                            ok += 1
+                            balance_total_text = self._token_amount_text(symbol, total)
+                        msg = f"{prefix}[{self._mask(addr, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(amount)}"
+                        self.root.after(0, lambda m=msg: self.log(m))
+                        self.root.after(0, lambda a=balance_total_text: self._set_progress_metrics(balance_text=a))
+                        if row_key:
+                            self._mark_query_status_context(row_key, context_sig)
+                            self.root.after(0, lambda k=row_key: self._set_query_status(k, "success"))
+                    except Exception as exc:
+                        with lock:
+                            failed += 1
+                        self.root.after(0, lambda m=f"{prefix} 查询失败：{exc}": self.log(m))
+                        if row_key:
+                            self._mark_query_status_context(row_key, context_sig)
+                            self.root.after(0, lambda k=row_key: self._set_query_status(k, "failed"))
+                    finally:
+                        jobs.task_done()
+
+            workers: list[threading.Thread] = []
+            worker_count = min(self._runtime_worker_threads(), len(targets))
+            for _ in range(worker_count):
+                t = threading.Thread(target=worker, daemon=True)
+                t.start()
+                workers.append(t)
+            for t in workers:
+                t.join()
 
             src_status_text = {"ok": "成功", "failed": "失败", "skip": "跳过"}.get(source_query_state, source_query_state)
             summary = (
@@ -1735,10 +2507,12 @@ class OnchainTransferPage:
             )
             self.root.after(0, lambda: self._refresh_tree())
             self.root.after(0, lambda: self.log(summary))
+            self.root.after(0, lambda s=ok, f=failed: self._finish_progress("query", s, f))
         except Exception as exc:
             err_text = str(exc)
             self.root.after(0, lambda m=f"余额查询任务异常终止：{err_text}": self.log(m))
             self.root.after(0, lambda e=err_text: messagebox.showerror("执行异常", e))
+            self.root.after(0, lambda s=ok if "ok" in locals() else 0, f=failed if "failed" in locals() else 0: self._finish_progress("query", s, f))
         finally:
             self.is_running = False
 
@@ -1747,6 +2521,12 @@ class OnchainTransferPage:
             symbol = token.symbol
             token_desc = self._token_desc(token)
             target_count = 1 if target else 0
+            context_sig = self._normalize_context_target(target)
+            row_keys_by_source = {source: self._many_to_one_key(source) for source in sources}
+            self._mark_query_status_contexts(list(row_keys_by_source.values()), context_sig)
+            self.root.after(0, lambda keys=self._unique_row_keys(list(row_keys_by_source.values())): self._begin_progress("query", keys))
+            self.root.after(0, lambda a=self._token_amount_text(symbol, Decimal("0")): self._set_progress_metrics(balance_text=a))
+            self.root.after(0, lambda keys=list(row_keys_by_source.values()): self._set_query_statuses(keys, "waiting"))
             self.root.after(
                 0,
                 lambda: self.log(
@@ -1763,15 +2543,17 @@ class OnchainTransferPage:
                         target_units = self.client.get_erc20_balance(network, token.contract, target)
                     target_amount = self._units_to_amount(target_units, token.decimals)
                     self.target_balance_cache[target] = target_amount
-                    target_text = f"{symbol}:{self._decimal_to_text(target_amount)}"
-                    self.root.after(0, lambda t=target_text: self.target_balance_var.set(t))
+                    if context_sig == self._normalize_context_target(self.target_address_var.get().strip()):
+                        target_text = f"{symbol}:{self._decimal_to_text(target_amount)}"
+                        self.root.after(0, lambda t=target_text: self.target_balance_var.set(t))
                     self.root.after(
                         0,
                         lambda m=f"[DST][{self._mask(target, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(target_amount)}": self.log(m),
                     )
                     target_query_state = "ok"
                 except Exception as exc:
-                    self.root.after(0, lambda: self.target_balance_var.set("-"))
+                    if context_sig == self._normalize_context_target(self.target_address_var.get().strip()):
+                        self.root.after(0, lambda: self.target_balance_var.set("-"))
                     self.root.after(0, lambda m=f"[DST] 查询失败：{exc}": self.log(m))
                     target_query_state = "failed"
             else:
@@ -1781,25 +2563,61 @@ class OnchainTransferPage:
             ok = 0
             failed = 0
             total = Decimal("0")
+            lock = threading.Lock()
+            jobs: queue.Queue[tuple[int, str]] = queue.Queue()
+            for i, source in enumerate(sources, start=1):
+                jobs.put((i, source))
             if not sources:
                 self.root.after(0, lambda: self.log("[SRC] 未提供源钱包，已跳过源钱包余额查询"))
-            for i, source in enumerate(sources, start=1):
-                prefix = f"[{i}/{len(sources)}]"
-                try:
-                    _pk, addr = self._resolve_wallet(source)
-                    if token.is_native:
-                        units = self.client.get_balance_wei(network, addr)
-                    else:
-                        units = self.client.get_erc20_balance(network, token.contract, addr)
-                    amount = self._units_to_amount(units, token.decimals)
-                    self.source_balance_cache[source] = amount
-                    total += amount
-                    msg = f"{prefix}[{self._mask(addr, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(amount)}"
-                    self.root.after(0, lambda m=msg: self.log(m))
-                    ok += 1
-                except Exception as exc:
-                    self.root.after(0, lambda m=f"{prefix} 查询失败：{exc}": self.log(m))
-                    failed += 1
+
+            def worker():
+                nonlocal ok, failed, total
+                while True:
+                    try:
+                        i, source = jobs.get_nowait()
+                    except queue.Empty:
+                        return
+                    row_key = row_keys_by_source.get(source, "")
+                    prefix = f"[{i}/{len(sources)}]"
+                    if row_key:
+                        self._mark_query_status_context(row_key, context_sig)
+                        self.root.after(0, lambda k=row_key: self._set_query_status(k, "running"))
+                    try:
+                        _pk, addr = self._resolve_wallet(source)
+                        if token.is_native:
+                            units = self.client.get_balance_wei(network, addr)
+                        else:
+                            units = self.client.get_erc20_balance(network, token.contract, addr)
+                        amount = self._units_to_amount(units, token.decimals)
+                        with lock:
+                            self.source_balance_cache[source] = amount
+                            total += amount
+                            ok += 1
+                            balance_total_text = self._token_amount_text(symbol, total)
+                        msg = f"{prefix}[{self._mask(addr, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(amount)}"
+                        self.root.after(0, lambda m=msg: self.log(m))
+                        self.root.after(0, lambda a=balance_total_text: self._set_progress_metrics(balance_text=a))
+                        if row_key:
+                            self._mark_query_status_context(row_key, context_sig)
+                            self.root.after(0, lambda k=row_key: self._set_query_status(k, "success"))
+                    except Exception as exc:
+                        with lock:
+                            failed += 1
+                        self.root.after(0, lambda m=f"{prefix} 查询失败：{exc}": self.log(m))
+                        if row_key:
+                            self._mark_query_status_context(row_key, context_sig)
+                            self.root.after(0, lambda k=row_key: self._set_query_status(k, "failed"))
+                    finally:
+                        jobs.task_done()
+
+            workers: list[threading.Thread] = []
+            worker_count = min(self._runtime_worker_threads(), len(sources))
+            for _ in range(worker_count):
+                t = threading.Thread(target=worker, daemon=True)
+                t.start()
+                workers.append(t)
+            for t in workers:
+                t.join()
 
             dst_status_text = {"ok": "成功", "failed": "失败", "skip": "跳过"}.get(target_query_state, target_query_state)
             summary = (
@@ -1808,14 +2626,17 @@ class OnchainTransferPage:
             )
             self.root.after(0, lambda: self._refresh_tree())
             self.root.after(0, lambda: self.log(summary))
+            self.root.after(0, lambda s=ok, f=failed: self._finish_progress("query", s, f))
         except Exception as exc:
             err_text = str(exc)
             self.root.after(0, lambda m=f"余额查询任务异常终止：{err_text}": self.log(m))
             self.root.after(0, lambda e=err_text: messagebox.showerror("执行异常", e))
+            self.root.after(0, lambda s=ok if "ok" in locals() else 0, f=failed if "failed" in locals() else 0: self._finish_progress("query", s, f))
         finally:
             self.is_running = False
 
     def _resolve_amount_and_gas(self, params: WithdrawRuntimeParams, source_addr: str, target_addr: str) -> tuple[int, int, int, str]:
+        target_addr = self._validate_recipient_address(target_addr, "接收地址")
         gas_price = self.client.get_gas_price_wei(params.network)
 
         if params.token_is_native:
@@ -1999,23 +2820,55 @@ class OnchainTransferPage:
 
     def _run_batch_transfer(self, jobs_data: list[tuple[str, str, str]], params: WithdrawRuntimeParams, dry_run: bool):
         try:
+            def dispatch_ui(callback) -> None:
+                try:
+                    self.root.after(0, callback)
+                except Exception:
+                    try:
+                        callback()
+                    except Exception:
+                        pass
+
+            def job_prefix(index: int) -> str:
+                return f"[{index}/{len(jobs_data)}]"
+
             amount_view = params.amount
             token_desc = self._token_desc_from_params(params)
+            progress_keys = self._unique_row_keys([row_key for row_key, _source, _target in jobs_data])
+            track_amount_total = not (dry_run and params.amount == self.AMOUNT_ALL_LABEL)
+            context_by_row_key = {
+                row_key: self._row_context_for_values(row_key, source, target)
+                for row_key, source, target in jobs_data
+            }
             if params.random_enabled and params.random_min is not None and params.random_max is not None:
                 amount_view = f"random({params.random_min:.2f}~{params.random_max:.2f})"
-            self.root.after(
-                0,
+            dispatch_ui(lambda keys=progress_keys: self._begin_progress("transfer", keys))
+            dispatch_ui(
+                lambda a=self._token_amount_text(params.coin, Decimal("0")), g=("-" if dry_run else self._estimated_gas_fee_text(params.network, 0)), amt_known=track_amount_total: self._set_progress_metrics(
+                    amount_text=(a if amt_known else "-"),
+                    gas_text=g,
+                ),
+            )
+            dispatch_ui(
                 lambda: self.log(
                     f"开始批量链上转账：mode={self._mode()}，任务={len(jobs_data)}，network={params.network}，"
                     f"coin={token_desc}，amount={amount_view}，delay={params.delay}，threads={params.threads}，dry_run={dry_run}"
                 ),
             )
+            fallback_prefixes: dict[str, str] = {}
             for row_key, _source, _target in jobs_data:
-                self.root.after(0, lambda k=row_key: self._set_status(k, "waiting"))
+                fallback_prefixes[row_key] = job_prefix(len(fallback_prefixes) + 1)
+                self._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
+                dispatch_ui(lambda k=row_key: self._set_status(k, "waiting"))
 
             success = 0
             failed = 0
+            resolved = 0
+            total_amount = Decimal("0")
+            total_gas_fee_wei = 0
             lock = threading.Lock()
+            resolved_event = threading.Event()
+            resolved_row_keys: set[str] = set()
             nonce_lock_map: dict[str, threading.Lock] = {}
             nonce_next_map: dict[str, int] = {}
             nonce_guard = threading.Lock()
@@ -2044,8 +2897,48 @@ class OnchainTransferPage:
                     if cached_next == used_nonce + 1:
                         nonce_next_map.pop(source_addr, None)
 
+            def finalize_job(row_key: str, result_status: str, msg: str, *, amount_text: str = "", gas_fee_wei: int = 0):
+                nonlocal success, failed, resolved, total_amount, total_gas_fee_wei
+                context_sig = context_by_row_key.get(row_key, "")
+                with lock:
+                    if row_key in resolved_row_keys:
+                        return
+                    resolved_row_keys.add(row_key)
+                    if result_status == "success":
+                        success += 1
+                        if track_amount_total:
+                            try:
+                                total_amount += Decimal(amount_text)
+                            except Exception:
+                                pass
+                    else:
+                        failed += 1
+                    total_gas_fee_wei += gas_fee_wei
+                    amount_total_text = self._token_amount_text(params.coin, total_amount) if track_amount_total else "-"
+                    gas_total_text = "-" if dry_run else self._estimated_gas_fee_text(params.network, total_gas_fee_wei)
+                    resolved += 1
+                    done = resolved >= len(jobs_data)
+                if done:
+                    resolved_event.set()
+                dispatch_ui(lambda m=msg: self.log(m))
+                self._mark_row_status_context(row_key, context_sig)
+                dispatch_ui(lambda k=row_key, s=result_status: self._set_status(k, s))
+                dispatch_ui(lambda a=amount_total_text, g=gas_total_text: self._set_progress_metrics(amount_text=a, gas_text=g))
+
+            def schedule_submitted_timeout(row_key: str, prefix: str, submitted_timeout_seconds: float):
+                timeout_msg = f"{prefix} 确认中超过 {submitted_timeout_seconds:g} 秒，自动判定失败"
+
+                def timeout_worker():
+                    if submitted_timeout_seconds > 0:
+                        time.sleep(submitted_timeout_seconds)
+                    finalize_job(row_key, "failed", timeout_msg)
+
+                if submitted_timeout_seconds > 0:
+                    threading.Thread(target=timeout_worker, daemon=True).start()
+                else:
+                    timeout_worker()
+
             def worker():
-                nonlocal success, failed
                 total = len(jobs_data)
                 while True:
                     try:
@@ -2053,11 +2946,18 @@ class OnchainTransferPage:
                     except queue.Empty:
                         return
 
-                    ok = False
+                    result_status = "failed"
                     msg = ""
+                    amount_text = ""
                     used_nonce: int | None = None
                     source_addr = ""
-                    self.root.after(0, lambda k=row_key: self._set_status(k, "running"))
+                    gas_fee_wei = 0
+                    tx_sent = False
+                    txid = ""
+                    self._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
+                    dispatch_ui(lambda k=row_key: self._set_status(k, "running"))
+                    submitted_timeout_seconds = max(0.0, float(getattr(self, "submitted_timeout_seconds", SUBMITTED_TIMEOUT_SECONDS)))
+                    prefix = job_prefix(i)
                     try:
                         if dry_run:
                             if params.random_enabled and params.random_min is not None and params.random_max is not None:
@@ -2071,12 +2971,12 @@ class OnchainTransferPage:
                                 f"{prefix} 模拟成功 -> {params.coin} {amount_text} "
                                 f"到 {self._mask(target, head=8, tail=6)}"
                             )
+                            result_status = "success"
                         else:
                             private_key, source_addr = self._resolve_wallet(source)
                             value_units, gas_price_wei, gas_limit, amount_text = self._resolve_amount_and_gas(
                                 params, source_addr, target
                             )
-                            prefix = f"[{i}/{total}][{self._mask(source_addr, head=8, tail=6)}]"
                             nonce = alloc_nonce(source_addr)
                             used_nonce = nonce
                             if params.token_is_native:
@@ -2100,29 +3000,35 @@ class OnchainTransferPage:
                                     gas_price_wei=gas_price_wei,
                                     gas_limit=gas_limit,
                                 )
-                            msg = (
-                                f"{prefix} 转账成功 -> {params.coin} {amount_text} 到 {self._mask(target, head=8, tail=6)}，"
-                                f"txid={txid}"
-                            )
-                        ok = True
+                            tx_sent = True
+                            if txid:
+                                gas_fee_wei = max(0, int(gas_limit)) * max(0, int(gas_price_wei))
+                                gas_text = self._gas_fee_amount_text(params.network, gas_fee_wei)
+                                msg = (
+                                    f"{prefix} 金额={params.coin} {amount_text}，预估gas={gas_text}，"
+                                    f"from={source_addr}，to={target}，txid={txid}"
+                                )
+                                result_status = "success"
+                            else:
+                                msg = (
+                                    f"{prefix} 转账确认中：未拿到 txid，"
+                                    f"from={source_addr}，to={target}"
+                                )
+                                result_status = "submitted"
                     except Exception as exc:
-                        if used_nonce is not None and source_addr:
+                        if used_nonce is not None and source_addr and not tx_sent:
                             rollback_nonce(source_addr, used_nonce)
                         msg = f"[{i}/{total}] 转账失败：{exc}"
                     finally:
                         jobs_q.task_done()
 
-                    self.root.after(0, lambda m=msg: self.log(m))
-                    if ok:
-                        self.root.after(0, lambda k=row_key: self._set_status(k, "success"))
+                    if result_status == "submitted":
+                        dispatch_ui(lambda m=msg: self.log(m))
+                        self._mark_row_status_context(row_key, context_by_row_key.get(row_key, ""))
+                        dispatch_ui(lambda k=row_key: self._set_status(k, "submitted"))
+                        schedule_submitted_timeout(row_key, prefix, submitted_timeout_seconds)
                     else:
-                        self.root.after(0, lambda k=row_key: self._set_status(k, "failed"))
-
-                    with lock:
-                        if ok:
-                            success += 1
-                        else:
-                            failed += 1
+                        finalize_job(row_key, result_status, msg, amount_text=amount_text, gas_fee_wei=gas_fee_wei)
                     if params.delay > 0:
                         time.sleep(params.delay)
 
@@ -2134,13 +3040,37 @@ class OnchainTransferPage:
                 workers.append(t)
             for t in workers:
                 t.join()
+            batch_finalize_timeout_seconds = max(
+                0.2,
+                max(0.0, float(getattr(self, "submitted_timeout_seconds", SUBMITTED_TIMEOUT_SECONDS))) + 1.0,
+            )
+            if len(jobs_data) == 0:
+                resolved_event.set()
+            if not resolved_event.wait(batch_finalize_timeout_seconds):
+                with lock:
+                    pending_row_keys = [row_key for row_key in progress_keys if row_key not in resolved_row_keys]
+                for row_key in pending_row_keys:
+                    prefix = fallback_prefixes.get(row_key, "")
+                    timeout_msg = f"{prefix} 任务收尾超时，自动判定失败" if prefix else "任务收尾超时，自动判定失败"
+                    finalize_job(row_key, "failed", timeout_msg)
 
             summary = f"链上转账任务结束：成功 {success}，失败 {failed}"
-            self.root.after(0, lambda: self.log(summary))
-            self.root.after(0, lambda: messagebox.showinfo("执行完成", summary))
+            if not dry_run:
+                summary = (
+                    f"{summary}，转账总额={self._token_amount_text(params.coin, total_amount) if track_amount_total else '-'}，"
+                    f"预估gas合计={self._gas_fee_amount_text(params.network, total_gas_fee_wei)}"
+                )
+            else:
+                summary = f"{summary}，转账总额={self._token_amount_text(params.coin, total_amount) if track_amount_total else '-'}，预估gas合计=-"
+            dispatch_ui(lambda: self.log(summary))
+            dispatch_ui(lambda: messagebox.showinfo("执行完成", summary))
+            dispatch_ui(lambda s=success, f=failed: self._finish_progress("transfer", s, f))
         except Exception as exc:
             err_text = str(exc)
-            self.root.after(0, lambda m=f"链上转账任务异常终止：{err_text}": self.log(m))
-            self.root.after(0, lambda e=err_text: messagebox.showerror("执行异常", e))
+            dispatch_ui(lambda m=f"链上转账任务异常终止：{err_text}": self.log(m))
+            dispatch_ui(lambda e=err_text: messagebox.showerror("执行异常", e))
+            dispatch_ui(
+                lambda s=success if "success" in locals() else 0, f=failed if "failed" in locals() else 0: self._finish_progress("transfer", s, f),
+            )
         finally:
             self.is_running = False

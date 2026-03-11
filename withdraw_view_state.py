@@ -7,6 +7,29 @@ from decimal import Decimal
 from tkinter import messagebox
 
 from core_models import AccountEntry
+import task_progress
+
+
+def _is_one_to_many_runtime(app) -> bool:
+    checker = getattr(app, "_is_one_to_many_mode", None)
+    if not callable(checker):
+        return False
+    try:
+        return bool(checker())
+    except Exception:
+        return False
+
+
+def _one_to_many_status_context(app) -> str:
+    return app.source_api_key_var.get().strip() if hasattr(app, "source_api_key_var") else ""
+
+
+def _ensure_withdraw_status_context(app) -> dict[str, str]:
+    context = getattr(app, "account_withdraw_status_context", None)
+    if context is None:
+        context = {}
+        app.account_withdraw_status_context = context
+    return context
 
 
 def on_mode_var_changed(app, *_args) -> None:
@@ -15,20 +38,21 @@ def on_mode_var_changed(app, *_args) -> None:
         app.mode_var.set(app.MODE_M2M)
         mode = app.MODE_M2M
     app.start_refresh_network_options()
-    if hasattr(app, "import_hint_label"):
-        if mode == app.MODE_1M:
-            text = "提示：点击账号列表后可按 Cmd+V / Ctrl+V 粘贴提现地址（每行一个地址）"
-        else:
-            text = "提示：点击账号列表后可直接按 Cmd+V / Ctrl+V 粘贴导入"
-        app.import_hint_label.configure(text=text)
     app._update_source_balance_display()
     app._apply_setting_layout(compact=bool(app._compact_mode))
     app._refresh_tree()
     app._resize_tree_columns()
+    if hasattr(app, "_update_empty_import_hint"):
+        app._update_empty_import_hint()
 
 
 def on_source_api_changed(app, *_args) -> None:
     app._update_source_balance_display()
+    if not _is_one_to_many_runtime(app):
+        return
+    if not app.is_running:
+        task_progress.reset_metrics(app, amount_label="提现总额")
+    app._refresh_tree()
 
 
 def update_source_balance_display(app) -> None:
@@ -97,8 +121,23 @@ def one_to_many_balance_text(app) -> str:
     return app._all_balances_text(source_key)
 
 
+def display_status(app, key: str) -> str:
+    query_status = getattr(app, "account_query_status", {})
+    if key in query_status:
+        return query_status.get(key, "")
+    status = app.account_withdraw_status.get(key, "")
+    if not status:
+        return ""
+    if _is_one_to_many_runtime(app):
+        current_context = _one_to_many_status_context(app)
+        stored_contexts = _ensure_withdraw_status_context(app)
+        if key in stored_contexts and stored_contexts.get(key, "") != current_context:
+            return ""
+    return status
+
+
 def withdraw_status_text(app, api_key: str) -> str:
-    status = app.account_withdraw_status.get(api_key, "")
+    status = display_status(app, api_key)
     if status == "waiting":
         return "等待中"
     if status == "running":
@@ -107,6 +146,8 @@ def withdraw_status_text(app, api_key: str) -> str:
         return "完成"
     if status == "failed":
         return "失败"
+    if status == "submitted":
+        return "确认中"
     return "-"
 
 
@@ -119,19 +160,47 @@ def withdraw_status_tag(status: str) -> str:
         return "st_success"
     if status == "failed":
         return "st_failed"
+    if status == "submitted":
+        return "st_submitted"
     return ""
 
 
 def set_account_status(app, api_key: str, status: str) -> None:
+    if hasattr(app, "account_query_status"):
+        app.account_query_status.pop(api_key, None)
     app.account_withdraw_status[api_key] = status
-    row_id = app.row_id_by_api_key.get(api_key)
-    if row_id and row_id in app.row_index_map:
+    if _is_one_to_many_runtime(app):
+        _ensure_withdraw_status_context(app)[api_key] = _one_to_many_status_context(app)
+    else:
+        _ensure_withdraw_status_context(app).pop(api_key, None)
+    row_id = getattr(app, "row_id_by_api_key", {}).get(api_key)
+    row_index_map = getattr(app, "row_index_map", {})
+    if row_id and row_id in row_index_map:
         values = list(app.tree.item(row_id, "values"))
         if len(values) >= 7:
             values[5] = app._withdraw_status_text(api_key)
             app.tree.item(row_id, values=values)
         tag = app._withdraw_status_tag(status)
         app.tree.item(row_id, tags=(tag,) if tag else ())
+    if hasattr(app, "_refresh_progress_if_active"):
+        app._refresh_progress_if_active("withdraw", api_key)
+
+
+def set_account_query_status(app, api_key: str, status: str) -> None:
+    if not hasattr(app, "account_query_status"):
+        app.account_query_status = {}
+    app.account_query_status[api_key] = status
+    row_id = getattr(app, "row_id_by_api_key", {}).get(api_key)
+    row_index_map = getattr(app, "row_index_map", {})
+    if row_id and row_id in row_index_map:
+        values = list(app.tree.item(row_id, "values"))
+        if len(values) >= 7:
+            values[5] = app._withdraw_status_text(api_key)
+            app.tree.item(row_id, values=values)
+        tag = app._withdraw_status_tag(display_status(app, api_key))
+        app.tree.item(row_id, tags=(tag,) if tag else ())
+    if hasattr(app, "_refresh_progress_if_active"):
+        app._refresh_progress_if_active("query", api_key)
 
 
 def totals_to_text(app, totals: dict[str, Decimal]) -> str:

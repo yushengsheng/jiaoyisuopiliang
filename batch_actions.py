@@ -9,6 +9,12 @@ from tkinter import messagebox
 from core_models import AccountEntry
 
 
+def _has_submitted_records(app) -> bool:
+    if app._is_one_to_many_mode():
+        return any(app._display_account_status(addr) == "submitted" for addr in app.store.one_to_many_addresses)
+    return any(app.account_withdraw_status.get(acc.api_key, "") == "submitted" for acc in app.store.accounts)
+
+
 def start_batch_withdraw(app) -> None:
     if app.is_running:
         messagebox.showwarning("提示", "已有任务在运行")
@@ -82,7 +88,10 @@ def start_retry_failed(app) -> None:
     one_to_many = app._is_one_to_many_mode()
     accounts = app._failed_accounts_for_retry()
     if not accounts:
-        messagebox.showwarning("提示", "当前没有失败账号可重试")
+        tip = "当前没有失败账号可重试"
+        if _has_submitted_records(app):
+            tip = "当前没有失败账号可重试，存在确认中的记录，请等待自动确认完成"
+        messagebox.showwarning("提示", tip)
         return
     if one_to_many and app._is_amount_all(params.amount) and len(accounts) > 1:
         messagebox.showerror("参数错误", "重试模式下，数量为“全部”时只能处理 1 个失败地址")

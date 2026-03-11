@@ -20,6 +20,12 @@ from decimal import Decimal
 from core_models import AccountEntry, EvmToken
 
 
+class SubmissionUncertainError(RuntimeError):
+    def __init__(self, message: str, *, reference: str = ""):
+        super().__init__(message)
+        self.reference = str(reference or "")
+
+
 class EvmClient:
     NATIVE_GAS_LIMIT = 21000
     ERC20_DEFAULT_GAS_LIMIT = 70000
@@ -56,7 +62,6 @@ class EvmClient:
             EvmToken(symbol="USDC", contract="0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", decimals=18, is_native=False),
         ],
     }
-
     def _network_info(self, network: str) -> dict:
         net = network.strip().upper()
         info = self.NETWORKS.get(net)
@@ -101,9 +106,38 @@ class EvmClient:
         s = cls._ensure_hex_prefixed(value)
         return "0x" + s[2:].lower()
 
+    @classmethod
+    def to_checksum_address(cls, value: str) -> str:
+        normalized = cls.normalize_address(value)
+        try:
+            from eth_utils import to_checksum_address  # type: ignore
+
+            return str(to_checksum_address(normalized))
+        except Exception:
+            return normalized
+
     @staticmethod
     def is_address(value: str) -> bool:
         return bool(re.fullmatch(r"0x[a-fA-F0-9]{40}", value.strip()))
+
+    @classmethod
+    def validate_evm_address(cls, value: str, field_label: str = "地址") -> str:
+        raw = str(value or "").strip()
+        if not cls.is_address(raw):
+            raise RuntimeError(f"{field_label}格式错误：{raw}")
+
+        body = cls._strip_0x(raw)
+        has_lower = any(ch.isalpha() and ch.islower() for ch in body)
+        has_upper = any(ch.isalpha() and ch.isupper() for ch in body)
+        if has_lower and has_upper:
+            try:
+                from eth_utils import is_checksum_address  # type: ignore
+            except Exception as exc:
+                raise RuntimeError(f"{field_label}校验失败：缺少 checksum 校验依赖，无法验证大小写混合地址") from exc
+            if not bool(is_checksum_address(cls._ensure_hex_prefixed(raw))):
+                raise RuntimeError(f"{field_label}校验失败：大小写混合地址不符合 EVM checksum 规范")
+
+        return cls.to_checksum_address(raw)
 
     def credential_to_private_key(self, credential: str) -> str:
         s = credential.strip()
@@ -324,6 +358,33 @@ class EvmClient:
             pass
         return self.ERC20_DEFAULT_GAS_LIMIT
 
+    @staticmethod
+    def _signed_raw_transaction_hex(signed_tx) -> str:
+        raw = getattr(signed_tx, "raw_transaction", None)
+        if raw is None:
+            raw = getattr(signed_tx, "rawTransaction", None)
+        if raw is None:
+            raise RuntimeError("签名结果缺少 raw transaction")
+        if hasattr(raw, "hex"):
+            try:
+                return EvmClient._ensure_hex_prefixed(raw.hex())
+            except Exception:
+                pass
+        if isinstance(raw, (bytes, bytearray)):
+            return EvmClient._ensure_hex_prefixed(bytes(raw).hex())
+        return EvmClient._ensure_hex_prefixed(str(raw))
+
+    def _sign_transaction_hex(self, tx: dict, private_key: str, error_prefix: str) -> str:
+        Account = self._ensure_eth_account()
+        try:
+            signed = Account.sign_transaction(tx, private_key=private_key)
+        except Exception as exc:
+            raise RuntimeError(f"{error_prefix}：{exc}") from exc
+        try:
+            return self._signed_raw_transaction_hex(signed)
+        except Exception as exc:
+            raise RuntimeError(f"{error_prefix}结果解析失败：{exc}") from exc
+
     def send_native_transfer(
         self,
         network: str,
@@ -336,24 +397,17 @@ class EvmClient:
     ) -> str:
         if value_wei <= 0:
             raise RuntimeError("转账金额必须大于 0")
-        if not self.is_address(to_address):
-            raise RuntimeError(f"接收地址格式错误：{to_address}")
+        safe_to_address = self.validate_evm_address(to_address, "接收地址")
 
-        Account = self._ensure_eth_account()
         tx = {
             "nonce": int(nonce),
-            "to": to_address,
+            "to": safe_to_address,
             "value": int(value_wei),
             "gas": int(gas_limit),
             "gasPrice": int(gas_price_wei),
             "chainId": self.get_chain_id(network),
         }
-        try:
-            signed = Account.sign_transaction(tx, private_key=private_key)
-        except Exception as exc:
-            raise RuntimeError(f"交易签名失败：{exc}") from exc
-
-        raw = self._ensure_hex_prefixed(signed.raw_transaction.hex())
+        raw = self._sign_transaction_hex(tx, private_key, "交易签名失败")
         tx_hash = self._rpc_call(network, "eth_sendRawTransaction", [raw])
         return str(tx_hash)
 
@@ -370,26 +424,19 @@ class EvmClient:
     ) -> str:
         if amount_units <= 0:
             raise RuntimeError("代币转账数量必须大于 0")
-        if not self.is_address(to_address):
-            raise RuntimeError(f"接收地址格式错误：{to_address}")
+        safe_to_address = self.validate_evm_address(to_address, "接收地址")
 
-        Account = self._ensure_eth_account()
-        data = "0xa9059cbb" + self._abi_encode_address(to_address) + self._abi_encode_uint(amount_units)
+        data = "0xa9059cbb" + self._abi_encode_address(safe_to_address) + self._abi_encode_uint(amount_units)
         tx = {
             "nonce": int(nonce),
-            "to": self.normalize_address(token_contract),
+            "to": self.to_checksum_address(token_contract),
             "value": 0,
-            "data": data,
+            "data": self._ensure_hex_prefixed(data),
             "gas": int(gas_limit),
             "gasPrice": int(gas_price_wei),
             "chainId": self.get_chain_id(network),
         }
-        try:
-            signed = Account.sign_transaction(tx, private_key=private_key)
-        except Exception as exc:
-            raise RuntimeError(f"代币交易签名失败：{exc}") from exc
-
-        raw = self._ensure_hex_prefixed(signed.raw_transaction.hex())
+        raw = self._sign_transaction_hex(tx, private_key, "代币交易签名失败")
         tx_hash = self._rpc_call(network, "eth_sendRawTransaction", [raw])
         return str(tx_hash)
 
@@ -403,8 +450,17 @@ class BinanceClient:
     def _sign(secret: str, query: str) -> str:
         return hmac.new(secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
 
-    def _signed_request(self, api_key: str, api_secret: str, method: str, path: str, params: dict) -> dict:
-        max_attempts = 3
+    def _signed_request(
+        self,
+        api_key: str,
+        api_secret: str,
+        method: str,
+        path: str,
+        params: dict,
+        *,
+        non_idempotent: bool = False,
+    ) -> dict:
+        max_attempts = 1 if non_idempotent else 3
         for attempt in range(1, max_attempts + 1):
             signed_params = dict(params)
             signed_params["timestamp"] = int(time.time() * 1000)
@@ -427,7 +483,14 @@ class BinanceClient:
             try:
                 with urllib.request.urlopen(request, timeout=30) as response:
                     payload = response.read().decode("utf-8")
-                    return json.loads(payload) if payload else {}
+                    try:
+                        return json.loads(payload) if payload else {}
+                    except json.JSONDecodeError as exc:
+                        if non_idempotent:
+                            raise SubmissionUncertainError(
+                                "提现请求结果不确定：响应无法解析，系统将自动继续确认"
+                            ) from exc
+                        raise RuntimeError("响应解析失败")
             except urllib.error.HTTPError as exc:
                 payload = exc.read().decode("utf-8", errors="ignore")
                 err_code = None
@@ -440,11 +503,19 @@ class BinanceClient:
                     pass
 
                 retryable = exc.code in {418, 429, 500, 502, 503, 504} or err_code in {-1003, -1021}
+                if non_idempotent and retryable:
+                    raise SubmissionUncertainError(
+                        f"提现请求结果不确定：HTTP {exc.code} / code={err_code} msg={err_msg}，系统将自动继续确认"
+                    )
                 if retryable and attempt < max_attempts:
                     time.sleep(0.6 * attempt)
                     continue
                 raise RuntimeError(f"HTTP {exc.code} / code={err_code} msg={err_msg}")
             except urllib.error.URLError as exc:
+                if non_idempotent:
+                    raise SubmissionUncertainError(
+                        f"提现请求结果不确定：网络错误：{exc}，系统将自动继续确认"
+                    )
                 if attempt < max_attempts:
                     time.sleep(0.6 * attempt)
                     continue
@@ -452,7 +523,19 @@ class BinanceClient:
 
         raise RuntimeError("请求失败：已达到最大重试次数")
 
-    def withdraw(self, account: AccountEntry, coin: str, amount: str, network: str = "") -> dict:
+    @staticmethod
+    def new_withdraw_order_id() -> str:
+        return f"codex_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+
+    def withdraw(
+        self,
+        account: AccountEntry,
+        coin: str,
+        amount: str,
+        network: str = "",
+        *,
+        withdraw_order_id: str = "",
+    ) -> dict:
         params = {
             "coin": coin,
             "address": account.address,
@@ -460,6 +543,8 @@ class BinanceClient:
         }
         if network:
             params["network"] = network
+        if withdraw_order_id:
+            params["withdrawOrderId"] = withdraw_order_id
 
         return self._signed_request(
             api_key=account.api_key,
@@ -467,6 +552,7 @@ class BinanceClient:
             method="POST",
             path="/sapi/v1/capital/withdraw/apply",
             params=params,
+            non_idempotent=True,
         )
 
     def get_all_spot_balances(self, account: AccountEntry, include_zero: bool = True) -> dict[str, tuple[Decimal, Decimal]]:
@@ -537,6 +623,38 @@ class BinanceClient:
             return result
         return []
 
+    def get_withdraw_fee(self, account: AccountEntry, coin: str, network: str = "") -> Decimal | None:
+        coin_u = coin.strip().upper()
+        network_u = network.strip().upper()
+        if not coin_u:
+            return None
+        configs = self.get_withdraw_config(account)
+        for item in configs:
+            if str(item.get("coin", "")).strip().upper() != coin_u:
+                continue
+            fallback_fee: Decimal | None = None
+            for n in item.get("networkList", []) or []:
+                code = str(n.get("network", "")).strip().upper()
+                fee_raw = n.get("withdrawFee")
+                if fee_raw in {None, ""}:
+                    fee = None
+                else:
+                    try:
+                        fee = Decimal(str(fee_raw))
+                    except Exception:
+                        fee = None
+                if not network_u:
+                    is_default = str(n.get("isDefault", "")).strip().lower() in {"true", "1"}
+                    if is_default:
+                        return fee
+                    if fallback_fee is None:
+                        fallback_fee = fee
+                    continue
+                if code == network_u:
+                    return fee
+            return fallback_fee
+        return None
+
     def get_spot_balance(self, account: AccountEntry, coin: str) -> tuple[Decimal, Decimal]:
         coin = coin.strip().upper()
         balances = self.get_all_spot_balances(account, include_zero=True)
@@ -564,6 +682,7 @@ class BitgetClient:
         api_key: str = "",
         api_secret: str = "",
         passphrase: str = "",
+        non_idempotent: bool = False,
     ) -> dict:
         method_u = method.upper()
         query = urllib.parse.urlencode(params or {})
@@ -572,7 +691,7 @@ class BitgetClient:
         data = body_text.encode("utf-8") if method_u != "GET" else None
         url = f"{self.base_url}{request_path}"
 
-        max_attempts = 3
+        max_attempts = 1 if non_idempotent else 3
         for attempt in range(1, max_attempts + 1):
             headers = {"Content-Type": "application/json", "locale": "zh-CN"}
             if auth:
@@ -592,15 +711,30 @@ class BitgetClient:
             try:
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     payload = resp.read().decode("utf-8")
-                    j = json.loads(payload) if payload else {}
+                    try:
+                        j = json.loads(payload) if payload else {}
+                    except json.JSONDecodeError as exc:
+                        if non_idempotent:
+                            raise SubmissionUncertainError(
+                                "提现请求结果不确定：响应无法解析，系统将自动继续确认"
+                            ) from exc
+                        raise RuntimeError("响应解析失败")
             except urllib.error.HTTPError as exc:
                 payload = exc.read().decode("utf-8", errors="ignore")
                 retryable = exc.code in {429, 500, 502, 503, 504}
+                if non_idempotent and retryable:
+                    raise SubmissionUncertainError(
+                        f"提现请求结果不确定：HTTP {exc.code}: {payload}，系统将自动继续确认"
+                    )
                 if retryable and attempt < max_attempts:
                     time.sleep(0.5 * attempt)
                     continue
                 raise RuntimeError(f"HTTP {exc.code}: {payload}")
             except urllib.error.URLError as exc:
+                if non_idempotent:
+                    raise SubmissionUncertainError(
+                        f"提现请求结果不确定：网络错误：{exc}，系统将自动继续确认"
+                    )
                 if attempt < max_attempts:
                     time.sleep(0.5 * attempt)
                     continue
@@ -649,6 +783,44 @@ class BitgetClient:
                 seen.add(chain)
                 arr.append(chain)
         return arr
+
+    def get_withdraw_fee(self, coin: str, chain: str) -> Decimal | None:
+        coin_u = coin.strip().upper()
+        chain_u = chain.strip().upper()
+        if not coin_u:
+            return None
+        data = self.get_public_coins(coin_u)
+        target = None
+        for item in data:
+            name = str(item.get("coin", "")).strip().upper()
+            if not name:
+                name = str(item.get("coinName", "")).strip().upper()
+            if name == coin_u:
+                target = item
+                break
+        if target is None and data:
+            target = data[0]
+        if target is None:
+            return None
+
+        fallback_fee: Decimal | None = None
+        for c in target.get("chains", []) or []:
+            code = str(c.get("chain", "")).strip().upper()
+            fee_raw = c.get("withdrawFee")
+            if fee_raw in {None, ""}:
+                fee = None
+            else:
+                try:
+                    fee = Decimal(str(fee_raw))
+                except Exception:
+                    fee = None
+            if not chain_u:
+                if fallback_fee is None:
+                    fallback_fee = fee
+                continue
+            if code == chain_u:
+                return fee
+        return fallback_fee
 
     def get_account_assets(self, api_key: str, api_secret: str, passphrase: str) -> dict[str, Decimal]:
         j = self._request(
@@ -702,14 +874,17 @@ class BitgetClient:
         address: str,
         amount: str,
         chain: str,
+        *,
+        client_oid: str = "",
     ) -> dict:
+        safe_client_oid = client_oid.strip() or f"codex_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
         body = {
             "coin": coin.strip().upper(),
             "transferType": "on_chain",
             "address": address.strip(),
             "chain": chain.strip(),
             "size": amount,
-            "clientOid": f"codex_{int(time.time() * 1000)}_{random.randint(1000, 9999)}",
+            "clientOid": safe_client_oid,
         }
         j = self._request(
             "POST",
@@ -719,7 +894,11 @@ class BitgetClient:
             api_key=api_key,
             api_secret=api_secret,
             passphrase=passphrase,
+            non_idempotent=True,
         )
         data = j.get("data", {}) or {}
         return data if isinstance(data, dict) else {}
 
+    @staticmethod
+    def new_client_oid() -> str:
+        return f"codex_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"

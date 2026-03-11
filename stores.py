@@ -48,6 +48,9 @@ class AccountStore:
     def load(self) -> None:
         if not self.file_path.exists():
             self.accounts = []
+            self.one_to_many_addresses = []
+            self.one_to_many_source_api_key = ""
+            self.one_to_many_source_api_secret = ""
             self.settings = GlobalSettings()
             return
 

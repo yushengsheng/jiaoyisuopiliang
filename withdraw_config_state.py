@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 from tkinter import messagebox
 
 from core_models import GlobalSettings
+from shared_utils import decimal_to_text
 
 
 def load_data(app) -> None:
@@ -53,6 +55,18 @@ def apply_settings_to_store(app) -> bool:
     random_enabled = amount_mode == app.AMOUNT_MODE_RANDOM
     if amount_mode == app.AMOUNT_MODE_ALL:
         amount = app.AMOUNT_ALL_LABEL
+    elif amount_mode == app.AMOUNT_MODE_FIXED:
+        if not amount:
+            messagebox.showerror("参数错误", "提现数量不能为空")
+            return False
+        try:
+            amount_value = Decimal(amount)
+            if amount_value <= 0:
+                raise InvalidOperation
+            amount = decimal_to_text(amount_value)
+        except Exception:
+            messagebox.showerror("参数错误", "固定数量必须是大于 0 的数字")
+            return False
 
     if not coin:
         messagebox.showerror("参数错误", "提现币种不能为空")
@@ -72,6 +86,21 @@ def apply_settings_to_store(app) -> bool:
 
     random_min = app.random_min_var.get().strip()
     random_max = app.random_max_var.get().strip()
+    if random_enabled:
+        try:
+            random_min_value = Decimal(random_min)
+            random_max_value = Decimal(random_max)
+        except Exception:
+            messagebox.showerror("参数错误", "随机金额最小值/最大值格式错误")
+            return False
+        if random_min_value <= 0 or random_max_value <= 0:
+            messagebox.showerror("参数错误", "随机金额最小值和最大值必须大于 0")
+            return False
+        if random_max_value < random_min_value:
+            messagebox.showerror("参数错误", "随机金额最大值必须大于或等于最小值")
+            return False
+        random_min = decimal_to_text(random_min_value)
+        random_max = decimal_to_text(random_max_value)
 
     app.store.settings = GlobalSettings(
         coin=coin,

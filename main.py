@@ -24,22 +24,53 @@ from ui_dialogs import PasteImportDialog
 from withdraw_app import WithdrawApp
 
 
-def main():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    root = Tk()
+def _safe_style_configure(style: ttk.Style, style_name: str, **kwargs) -> None:
+    try:
+        style.configure(style_name, **kwargs)
+    except Exception:
+        pass
+
+
+def _safe_style_map(style: ttk.Style, style_name: str, **kwargs) -> None:
+    try:
+        style.map(style_name, **kwargs)
+    except Exception:
+        pass
+
+
+def _apply_apple_theme(root: Tk) -> None:
     style = ttk.Style(root)
     if "aqua" in style.theme_names():
-        style.theme_use("aqua")
-    style.configure("Menu.TNotebook.Tab", font=("PingFang SC", 15, "bold"), foreground="#c1272d", padding=(14, 8))
-    style.map(
+        try:
+            style.theme_use("aqua")
+        except Exception:
+            pass
+
+    try:
+        root.configure(bg="#f5f5f7")
+    except Exception:
+        pass
+
+    _safe_style_configure(style, "Hero.TLabel", foreground="#1d1d1f", font=("PingFang SC", 20, "bold"))
+    _safe_style_configure(style, "Subtle.TLabel", foreground="#6e6e73")
+    _safe_style_configure(style, "Value.TLabel", foreground="#0b62c4")
+    _safe_style_configure(style, "Danger.TLabel", foreground="#a94442")
+    _safe_style_configure(style, "Action.TButton", font=("PingFang SC", 12, "bold"), padding=(10, 4))
+    _safe_style_configure(style, "Menu.TNotebook.Tab", font=("PingFang SC", 15, "bold"), padding=(14, 8))
+    _safe_style_map(
+        style,
         "Menu.TNotebook.Tab",
         foreground=[("selected", "#c1272d"), ("active", "#aa141b"), ("!disabled", "#c1272d")],
     )
-    style.configure("Action.TButton", font=("PingFang SC", 12, "bold"), foreground="#6c2dc7", padding=(10, 4))
-    style.map(
-        "Action.TButton",
-        foreground=[("pressed", "#5923a6"), ("active", "#5923a6"), ("!disabled", "#6c2dc7")],
-    )
+
+
+def main():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    root = Tk()
+    try:
+        _apply_apple_theme(root)
+    except Exception:
+        pass
     WithdrawApp(root)
     root.mainloop()
 

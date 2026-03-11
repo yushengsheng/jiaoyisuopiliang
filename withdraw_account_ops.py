@@ -10,18 +10,184 @@ from tkinter import END, messagebox
 
 from app_paths import DATA_FILE
 from core_models import AccountEntry
+from table_import_utils import (
+    column_name_from_identifier,
+    heading_text,
+    merge_column_values,
+    parse_single_value_lines,
+    update_import_target_bar,
+)
 from ui_dialogs import PasteImportDialog
+
+ACCOUNT_IMPORT_FIELDS = ("api_key", "api_secret", "address")
+
+
+def _available_import_targets(app) -> dict[str, str]:
+    if app._is_one_to_many_mode():
+        return {
+            "full": "整行导入",
+            "address": "提现地址列",
+        }
+    return {
+        "full": "整行导入",
+        "api_key": "API Key 列",
+        "api_secret": "API Secret 列",
+        "address": "提现地址列",
+    }
+
+
+def _current_import_target(app) -> str:
+    target = str(getattr(app, "_import_target", "full") or "full")
+    if target not in _available_import_targets(app):
+        target = "full"
+        app._import_target = target
+    return target
+
+
+def _ensure_account_import_drafts(app) -> list[dict[str, str]]:
+    drafts = getattr(app, "account_import_drafts", None)
+    if drafts is None:
+        drafts = []
+        app.account_import_drafts = drafts
+    return drafts
+
+
+def _ensure_checked_account_draft_rows(app) -> set[int]:
+    checked = getattr(app, "checked_account_draft_rows", None)
+    if checked is None:
+        checked = set()
+        app.checked_account_draft_rows = checked
+    return checked
+
+
+def apply_import_target_view(app) -> None:
+    tree = getattr(app, "tree", None)
+    base = getattr(app, "_tree_heading_base_texts", None)
+    if tree is None or not base:
+        return
+    target = _current_import_target(app)
+    importable = set(_available_import_targets(app)) - {"full"}
+    for column, text in base.items():
+        try:
+            tree.heading(column, text=heading_text(text, active=(column == target and column in importable)))
+        except Exception:
+            continue
+    update_import_target_bar(
+        getattr(app, "import_target_bar", None),
+        tree,
+        getattr(app, "_tree_column_ids", ()),
+        target,
+    )
+
+
+def set_import_target(app, target: str, *, log_change: bool = False) -> None:
+    targets = _available_import_targets(app)
+    prev = _current_import_target(app)
+    if target not in targets:
+        target = "full"
+    app._import_target = target
+    apply_import_target_view(app)
+    tree = getattr(app, "tree", None)
+    if tree is not None and hasattr(tree, "focus_set"):
+        try:
+            tree.focus_set()
+        except Exception:
+            pass
+    if log_change and prev != target:
+        app.log(f"已切换粘贴目标：{targets[target]}")
+
+
+def on_tree_pointer_down(app, event):
+    region = app.tree.identify("region", event.x, event.y)
+    if region == "separator":
+        return None
+    if region == "heading":
+        column_id = app.tree.identify_column(event.x)
+        column = column_name_from_identifier(getattr(app, "_tree_column_ids", ()), column_id)
+        set_import_target(app, column if column in _available_import_targets(app) else "full", log_change=True)
+        return None
+    set_import_target(app, "full", log_change=True)
+    return None
+
+
+def _promote_complete_account_drafts(app) -> tuple[int, int]:
+    drafts = _ensure_account_import_drafts(app)
+    complete: list[AccountEntry] = []
+    remaining: list[dict[str, str]] = []
+    for row in drafts:
+        api_key = str(row.get("api_key", "") or "").strip()
+        api_secret = str(row.get("api_secret", "") or "").strip()
+        address = str(row.get("address", "") or "").strip()
+        if api_key and api_secret and address:
+            complete.append(AccountEntry(api_key=api_key, api_secret=api_secret, address=address))
+        else:
+            remaining.append(
+                {
+                    "api_key": api_key,
+                    "api_secret": api_secret,
+                    "address": address,
+                }
+            )
+    app.account_import_drafts = remaining
+    if not complete:
+        return 0, 0
+    return app.store.upsert_many(complete)
+
+
+def _import_account_column(app, field: str, lines: list[str], source: str) -> None:
+    if field == "address":
+        values = parse_single_value_lines(lines, "提现地址")
+    else:
+        label = "API Key" if field == "api_key" else "API Secret"
+        values = parse_single_value_lines(lines, label)
+    if not values:
+        messagebox.showwarning("提示", "没有可导入的数据")
+        return
+
+    drafts = _ensure_account_import_drafts(app)
+    merge_column_values(drafts, ACCOUNT_IMPORT_FIELDS, field, values)
+    created, updated = _promote_complete_account_drafts(app)
+    if created or updated:
+        app.checked_api_keys = {a.api_key for a in app.store.accounts}
+    app._refresh_tree()
+    if created or updated:
+        app.start_refresh_network_options()
+
+    parts = [f"{source}导入完成：写入 {len(values)} 条{_available_import_targets(app)[field]}"]
+    completed = created + updated
+    if completed:
+        parts.append(f"补齐 {completed} 个账号")
+    if app.account_import_drafts:
+        parts.append(f"待补齐 {len(app.account_import_drafts)} 行")
+    app.log("，".join(parts))
+
+
+def _selected_draft_index(app) -> int | None:
+    tree = getattr(app, "tree", None)
+    if tree is None or not hasattr(tree, "selection"):
+        return None
+    selected = tuple(tree.selection())
+    if not selected:
+        return None
+    return getattr(app, "draft_row_index_map", {}).get(selected[0])
 
 
 def refresh_tree(app) -> None:
     app.tree.delete(*app.tree.get_children())
     app.row_index_map = {}
     app.row_id_by_api_key = {}
+    app.draft_row_index_map = {}
 
     if app._is_one_to_many_mode():
         active_keys = set(app.store.one_to_many_addresses)
         app.checked_one_to_many_addresses.intersection_update(active_keys)
         app.account_withdraw_status = {k: v for k, v in app.account_withdraw_status.items() if k in active_keys}
+        if hasattr(app, "account_withdraw_status_context"):
+            app.account_withdraw_status_context = {
+                k: v for k, v in app.account_withdraw_status_context.items() if k in active_keys
+            }
+        if hasattr(app, "_tree_heading_base_texts"):
+            app._tree_heading_base_texts["balance"] = "地址余额"
         app.tree.heading("balance", text="地址余额")
         app._update_source_balance_display()
         for i, addr in enumerate(app.store.one_to_many_addresses, start=1):
@@ -30,7 +196,7 @@ def refresh_tree(app) -> None:
             app.row_id_by_api_key[addr] = row_id
             checked = "✓" if addr in app.checked_one_to_many_addresses else ""
             status_text = app._withdraw_status_text(addr)
-            status_tag = app._withdraw_status_tag(app.account_withdraw_status.get(addr, ""))
+            status_tag = app._withdraw_status_tag(app._display_account_status(addr))
             app.tree.insert(
                 "",
                 END,
@@ -38,12 +204,21 @@ def refresh_tree(app) -> None:
                 values=(checked, i, "-", "-", addr, status_text, "-"),
                 tags=(status_tag,) if status_tag else (),
             )
+        if hasattr(app, "_apply_import_target_view"):
+            app._apply_import_target_view()
+        if hasattr(app, "_update_empty_import_hint"):
+            app._update_empty_import_hint()
         return
 
     active_keys = {a.api_key for a in app.store.accounts}
+    drafts = _ensure_account_import_drafts(app)
+    checked_drafts = _ensure_checked_account_draft_rows(app)
     app.checked_api_keys.intersection_update(active_keys)
+    checked_drafts.intersection_update(set(range(len(drafts))))
     app.account_coin_balance_cache = {k: v for k, v in app.account_coin_balance_cache.items() if k in active_keys}
     app.account_withdraw_status = {k: v for k, v in app.account_withdraw_status.items() if k in active_keys}
+    if hasattr(app, "_tree_heading_base_texts"):
+        app._tree_heading_base_texts["balance"] = "账号余额(全币种)"
     app.tree.heading("balance", text="账号余额(全币种)")
 
     for i, acc in enumerate(app.store.accounts, start=1):
@@ -53,7 +228,7 @@ def refresh_tree(app) -> None:
         checked = "✓" if acc.api_key in app.checked_api_keys else ""
         status_text = app._withdraw_status_text(acc.api_key)
         bal_text = app._all_balances_text(acc.api_key)
-        status_tag = app._withdraw_status_tag(app.account_withdraw_status.get(acc.api_key, ""))
+        status_tag = app._withdraw_status_tag(app._display_account_status(acc.api_key))
         app.tree.insert(
             "",
             END,
@@ -61,6 +236,30 @@ def refresh_tree(app) -> None:
             values=(checked, i, app._mask(acc.api_key), app._mask(acc.api_secret), acc.address, status_text, bal_text),
             tags=(status_tag,) if status_tag else (),
         )
+    start_index = len(app.store.accounts) + 1
+    for i, row in enumerate(drafts, start=start_index):
+        row_id = f"draft_row_{i}"
+        draft_idx = i - start_index
+        app.draft_row_index_map[row_id] = draft_idx
+        app.tree.insert(
+            "",
+            END,
+            iid=row_id,
+            values=(
+                "✓" if draft_idx in checked_drafts else "",
+                i,
+                app._mask(row.get("api_key", "")) if row.get("api_key", "") else "-",
+                app._mask(row.get("api_secret", "")) if row.get("api_secret", "") else "-",
+                row.get("address", "") or "-",
+                "待补齐",
+                "-",
+            ),
+            tags=("st_incomplete",),
+        )
+    if hasattr(app, "_apply_import_target_view"):
+        app._apply_import_target_view()
+    if hasattr(app, "_update_empty_import_hint"):
+        app._update_empty_import_hint()
 
 
 def selected_indices(app) -> list[int]:
@@ -104,7 +303,7 @@ def failed_accounts_for_retry(app) -> list[AccountEntry]:
             return []
         failed_addrs: list[str] = []
         for addr in app.store.one_to_many_addresses:
-            if app.account_withdraw_status.get(addr, "") == "failed":
+            if app._display_account_status(addr) == "failed":
                 failed_addrs.append(addr)
         return [AccountEntry(api_key=source.api_key, api_secret=source.api_secret, address=addr) for addr in failed_addrs]
 
@@ -120,6 +319,19 @@ def on_tree_click(app, event):
         return None
     row_id = app.tree.identify_row(event.y)
     if not row_id:
+        return None
+    draft_idx = getattr(app, "draft_row_index_map", {}).get(row_id)
+    if draft_idx is not None and not app._is_one_to_many_mode():
+        checked_drafts = _ensure_checked_account_draft_rows(app)
+        checked = draft_idx not in checked_drafts
+        if checked:
+            checked_drafts.add(draft_idx)
+        else:
+            checked_drafts.discard(draft_idx)
+        values = list(app.tree.item(row_id, "values"))
+        if values:
+            values[0] = "✓" if checked else ""
+            app.tree.item(row_id, values=values)
         return None
     idx = app.row_index_map.get(row_id)
     if idx is None or not (0 <= idx < len(app.store.accounts)):
@@ -187,16 +399,23 @@ def toggle_check_all(app) -> None:
         app._refresh_tree()
         return
 
-    if not app.store.accounts:
+    drafts = _ensure_account_import_drafts(app)
+    checked_drafts = _ensure_checked_account_draft_rows(app)
+    if not app.store.accounts and not drafts:
         messagebox.showwarning("提示", "暂无账号")
         return
     all_keys = {a.api_key for a in app.store.accounts}
-    if app.checked_api_keys == all_keys:
+    all_draft_rows = set(range(len(drafts)))
+    if app.checked_api_keys == all_keys and checked_drafts == all_draft_rows:
         app.checked_api_keys.clear()
+        checked_drafts.clear()
         app.log("已取消全选")
     else:
         app.checked_api_keys = set(all_keys)
-        app.log(f"已全选 {len(all_keys)} 个账号")
+        checked_drafts.clear()
+        checked_drafts.update(all_draft_rows)
+        total = len(all_keys) + len(all_draft_rows)
+        app.log(f"已全选 {total} 条账号数据")
     app._refresh_tree()
 
 
@@ -276,11 +495,17 @@ def import_from_clipboard(app) -> None:
         return
 
     try:
+        target = _current_import_target(app)
+        lines = text.splitlines()
         if app._is_one_to_many_mode():
             rows = app._parse_address_lines(text.splitlines())
-        else:
-            rows = app._parse_account_lines(text.splitlines())
-        app._import_rows(rows, "剪贴板")
+            app._import_rows(rows, "剪贴板")
+            return
+        if target == "full":
+            rows = app._parse_account_lines(lines)
+            app._import_rows(rows, "剪贴板")
+            return
+        _import_account_column(app, target, lines, "剪贴板")
     except Exception as exc:
         messagebox.showerror("粘贴失败", str(exc))
 
@@ -332,9 +557,11 @@ def delete_selected(app) -> None:
     if app._is_one_to_many_mode():
         checked_addresses = set(app._checked_one_to_many_addresses())
         idxs = [i for i, addr in enumerate(app.store.one_to_many_addresses) if addr in checked_addresses]
+        draft_idxs: list[int] = []
     else:
         idxs = app._checked_indices()
-    if not idxs:
+        draft_idxs = sorted(_ensure_checked_account_draft_rows(app))
+    if not idxs and not draft_idxs:
         tip = "请先勾选要删除的地址" if app._is_one_to_many_mode() else "请先勾选要删除的账号"
         messagebox.showwarning("提示", tip)
         return
@@ -347,12 +574,18 @@ def delete_selected(app) -> None:
         app.log(f"已删除 {len(idxs)} 条地址")
         return
 
-    if not messagebox.askyesno("确认删除", f"确认删除 {len(idxs)} 条账号吗？"):
+    total = len(idxs) + len(draft_idxs)
+    if not messagebox.askyesno("确认删除", f"确认删除 {total} 条账号数据吗？"):
         return
     app.store.delete_by_indices(idxs)
+    drafts = _ensure_account_import_drafts(app)
+    for draft_idx in sorted(draft_idxs, reverse=True):
+        if 0 <= draft_idx < len(drafts):
+            drafts.pop(draft_idx)
+    _ensure_checked_account_draft_rows(app).clear()
     app._refresh_tree()
     app.start_refresh_network_options()
-    app.log(f"已删除 {len(idxs)} 条账号")
+    app.log(f"已删除 {total} 条账号数据")
 
 
 def _single_selected_index(app) -> int | None:
@@ -363,6 +596,10 @@ def _single_selected_index(app) -> int | None:
 
 
 def _selected_row_accounts(app) -> list[AccountEntry] | None:
+    draft_idx = _selected_draft_index(app)
+    if draft_idx is not None:
+        messagebox.showwarning("提示", "当前行为待补齐账号，请先补齐 API Key / API Secret / 提现地址")
+        return None
     idx = _single_selected_index(app)
     if idx is None:
         return None
@@ -441,6 +678,19 @@ def start_withdraw_current_row(app) -> None:
 
 
 def delete_current_row(app) -> None:
+    draft_idx = _selected_draft_index(app)
+    if draft_idx is not None and not app._is_one_to_many_mode():
+        drafts = _ensure_account_import_drafts(app)
+        if not (0 <= draft_idx < len(drafts)):
+            messagebox.showwarning("提示", "请先右键选中一条账号")
+            return
+        if not messagebox.askyesno("确认删除", "确认删除当前待补齐账号吗？"):
+            return
+        drafts.pop(draft_idx)
+        _ensure_checked_account_draft_rows(app).clear()
+        app._refresh_tree()
+        app.log("已删除当前待补齐账号")
+        return
     idx = _single_selected_index(app)
     if idx is None:
         tip = "请先右键选中一条地址" if app._is_one_to_many_mode() else "请先右键选中一条账号"
@@ -470,6 +720,12 @@ def delete_current_row(app) -> None:
 
 
 def save_all(app) -> None:
+    draft_count = len(_ensure_account_import_drafts(app)) if not app._is_one_to_many_mode() else 0
+    if draft_count and not messagebox.askyesno(
+        "未补齐提示",
+        f"当前有 {draft_count} 行待补齐账号，保存时只会写入已补齐账号，确认继续？",
+    ):
+        return
     if not app._apply_settings_to_store():
         return
     try:

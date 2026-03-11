@@ -18,6 +18,7 @@ from core_models import (
 )
 import ip_detection
 import network_options
+import task_progress
 import withdraw_config_state
 import withdraw_params
 import withdraw_ui
@@ -79,8 +80,8 @@ class WithdrawApp:
     def __init__(self, root: Tk):
         self.root = root
         self.root.title("交易所批量工具")
-        self.root.geometry("1180x760")
-        self.root.minsize(860, 560)
+        self.root.geometry("1260x820")
+        self.root.minsize(980, 640)
 
         self.store = AccountStore(DATA_FILE)
         self.client = BinanceClient()
@@ -93,7 +94,12 @@ class WithdrawApp:
         self.account_coin_balance_cache: dict[str, dict[str, Decimal]] = {}
         self.coin_network_cache: dict[str, list[str]] = {}
         self.account_withdraw_status: dict[str, str] = {}
+        self.account_withdraw_status_context: dict[str, str] = {}
+        self.account_query_status: dict[str, str] = {}
         self._compact_mode: bool | None = None
+        self._import_target = "full"
+        self.account_import_drafts: list[dict[str, str]] = []
+        self.checked_account_draft_rows: set[int] = set()
 
         self.mode_var = StringVar(value=self.MODE_M2M)
         self.coin_var = StringVar(value="USDT")
@@ -109,8 +115,15 @@ class WithdrawApp:
         self.threads_var = StringVar(value="2")
         self.dry_run_var = BooleanVar(value=True)
         self.ip_var = StringVar(value="未检测")
+        self.progress_var = StringVar(value=task_progress.idle_text("提现总额"))
         self.ip_detect_inflight = False
         self.ip_detect_lock = threading.Lock()
+        self._active_progress_kind = ""
+        self._active_progress_keys: list[str] = []
+        self._progress_amount_label = "提现总额"
+        self._summary_balance_text = "-"
+        self._summary_amount_text = "-"
+        self._summary_gas_text = "-"
 
         self._build_ui()
         self._load_data()
@@ -160,6 +173,9 @@ class WithdrawApp:
 
     def _on_log_resize(self, _event=None):
         withdraw_ui.on_log_resize(self, _event)
+
+    def _update_empty_import_hint(self):
+        withdraw_ui.update_empty_import_hint(self)
 
     def _load_data(self):
         withdraw_config_state.load_data(self)
@@ -221,14 +237,53 @@ class WithdrawApp:
     def _withdraw_status_tag(status: str) -> str:
         return withdraw_view_state.withdraw_status_tag(status)
 
+    def _display_account_status(self, key: str) -> str:
+        return withdraw_view_state.display_status(self, key)
+
     def _set_account_status(self, api_key: str, status: str):
         withdraw_view_state.set_account_status(self, api_key, status)
+
+    def _set_account_query_status(self, key: str, status: str):
+        withdraw_view_state.set_account_query_status(self, key, status)
 
     def _totals_to_text(self, totals: dict[str, Decimal]) -> str:
         return withdraw_view_state.totals_to_text(self, totals)
 
     def _replace_account_coin_totals(self, api_key: str, totals: dict[str, Decimal]):
         withdraw_view_state.replace_account_coin_totals(self, api_key, totals)
+
+    def _progress_store(self, kind: str) -> dict[str, str]:
+        if kind == "query":
+            return self.account_query_status
+        return self.account_withdraw_status
+
+    def _begin_progress(self, kind: str, row_keys: list[str]):
+        task_progress.begin(self, kind, row_keys, amount_label="提现总额")
+
+    def _refresh_progress_display(self):
+        task_progress.refresh_display(self)
+
+    def _refresh_progress_if_active(self, kind: str, row_key: str):
+        task_progress.refresh_if_active(self, kind, row_key)
+
+    def _finish_progress(self, kind: str, success: int, failed: int):
+        task_progress.finish(self, kind, success, failed)
+
+    def _set_query_statuses(self, row_keys: list[str], status: str):
+        for row_key in task_progress.unique_keys(row_keys):
+            self._set_account_query_status(row_key, status)
+
+    def _set_progress_metrics(
+        self,
+        *,
+        balance_text: str | None = None,
+        amount_text: str | None = None,
+        gas_text: str | None = None,
+    ):
+        task_progress.set_metrics(self, balance_text=balance_text, amount_text=amount_text, gas_text=gas_text)
+
+    def _coin_amount_text(self, coin: str, amount: Decimal) -> str:
+        return f"{self._decimal_to_text(amount)} {coin.strip().upper()}"
 
     @staticmethod
     def _mask(value: str, head: int = 6, tail: int = 4) -> str:
@@ -258,8 +313,17 @@ class WithdrawApp:
     def _on_tree_click(self, event):
         return account_ops.on_tree_click(self, event)
 
+    def _on_tree_pointer_down(self, event):
+        return account_ops.on_tree_pointer_down(self, event)
+
     def _on_tree_right_click(self, event):
         return account_ops.on_tree_right_click(self, event)
+
+    def _set_import_target(self, target: str, *, log_change: bool = False):
+        account_ops.set_import_target(self, target, log_change=log_change)
+
+    def _apply_import_target_view(self):
+        account_ops.apply_import_target_view(self)
 
     def toggle_check_all(self):
         account_ops.toggle_check_all(self)

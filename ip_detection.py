@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import threading
 import urllib.request
 
@@ -48,6 +49,10 @@ def fetch_public_ip() -> str:
             with urllib.request.urlopen(url, timeout=8) as resp:
                 ip = resp.read().decode("utf-8", errors="ignore").strip()
                 if ip and len(ip) <= 64:
+                    try:
+                        ipaddress.ip_address(ip)
+                    except ValueError:
+                        continue
                     return ip
         except Exception:
             continue
