@@ -620,10 +620,18 @@ def start_query_balance_current_row(app) -> None:
     if app.is_running:
         messagebox.showwarning("提示", "已有任务在运行")
         return
-    coin = app.coin_var.get().strip().upper()
+    coin = ""
+    if hasattr(app, "coin_var"):
+        try:
+            coin = app.coin_var.get().strip().upper()
+        except Exception:
+            coin = ""
     if not coin:
-        messagebox.showerror("参数错误", "请先填写币种（用于查询余额）")
-        return
+        settings = getattr(getattr(app, "store", None), "settings", None)
+        coin = str(getattr(settings, "coin", "") or "").strip().upper()
+    if not coin:
+        defaults = list(getattr(app, "DEFAULT_COIN_OPTIONS", ["USDT"]))
+        coin = str(defaults[0] if defaults else "USDT").strip().upper()
     accounts = _selected_row_accounts(app)
     if not accounts:
         tip = "请先右键选中一条地址" if app._is_one_to_many_mode() else "请先右键选中一条账号"

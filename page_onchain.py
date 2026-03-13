@@ -4,19 +4,34 @@
 from __future__ import annotations
 
 import queue
-import random
 import re
 import threading
 import time
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
+from decimal import ROUND_FLOOR, Decimal, InvalidOperation
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, W, Y, BooleanVar, DoubleVar, Frame as TkFrame, Menu, Scrollbar, StringVar
+from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, W, BooleanVar, DoubleVar, Frame as TkFrame, Menu, StringVar
 from tkinter import messagebox, ttk
 
 from api_clients import EvmClient
 from app_paths import ONCHAIN_DATA_FILE
 from core_models import EvmToken, OnchainPairEntry, WithdrawRuntimeParams
-from shared_utils import LOG_MAX_ROWS, append_log_row, decimal_to_text, make_scrollbar, mask_text, parse_worker_threads, random_decimal_between
+from shared_utils import (
+    LOG_MAX_ROWS,
+    bind_paste_shortcuts,
+    clear_ui_batch_size,
+    decimal_to_text,
+    dispatch_ui_callback,
+    flush_queued_log_rows,
+    flush_queued_ui_renders,
+    make_scrollbar,
+    mask_text,
+    parse_worker_threads,
+    queue_log_row,
+    queue_ui_render,
+    random_decimal_between,
+    schedule_ui_callback,
+    set_ui_batch_size,
+)
 from stores import OnchainStore
 from table_import_utils import (
     IMPORT_TARGET_PURPLE,
@@ -27,7 +42,6 @@ from table_import_utils import (
     update_import_target_bar,
 )
 import task_progress
-from ui_dialogs import PasteImportDialog
 
 SUBMITTED_TIMEOUT_SECONDS = 10.0
 
@@ -93,7 +107,7 @@ class OnchainTransferPage:
         self.random_min_var = StringVar(value="")
         self.random_max_var = StringVar(value="")
         self.delay_var = DoubleVar(value=1.0)
-        self.threads_var = StringVar(value="2")
+        self.threads_var = StringVar(value="10")
         self.dry_run_var = BooleanVar(value=True)
         self.source_credential_var = StringVar(value="")
         self.target_address_var = StringVar(value="")
@@ -141,6 +155,7 @@ class OnchainTransferPage:
         self.coin_box = ttk.Combobox(setting, textvariable=self.coin_var, width=16, state="readonly")
         self.lbl_contract_search = ttk.Label(setting, text="合约搜索")
         self.ent_contract_search = ttk.Entry(setting, textvariable=self.contract_search_var, width=40)
+        bind_paste_shortcuts(self.ent_contract_search)
         self.btn_contract_search = ttk.Button(setting, text="搜索并选择", command=self.search_contract_token)
 
         self.lbl_amount = ttk.Label(setting, text="转账数量*")
@@ -171,6 +186,8 @@ class OnchainTransferPage:
         self.lbl_source_balance_val = ttk.Label(setting, textvariable=self.source_balance_var, style="Value.TLabel")
         self.lbl_target_address = ttk.Label(setting, text="收款地址*")
         self.ent_target_address = ttk.Entry(setting, textvariable=self.target_address_var)
+        bind_paste_shortcuts(self.ent_source_credential)
+        bind_paste_shortcuts(self.ent_target_address)
         self.lbl_target_balance_title = ttk.Label(setting, text="收款地址余额")
         self.lbl_target_balance_val = ttk.Label(setting, textvariable=self.target_balance_var, style="Value.TLabel")
         self._apply_setting_layout("wide")
@@ -343,8 +360,8 @@ class OnchainTransferPage:
         return f"{self._decimal_to_text(amount)} {symbol.strip().upper()}"
 
     def _runtime_worker_threads(self) -> int:
-        raw = self.threads_var.get() if hasattr(self, "threads_var") else 2
-        return parse_worker_threads(raw, default=2)
+        raw = self.threads_var.get() if hasattr(self, "threads_var") else 10
+        return parse_worker_threads(raw, default=10)
 
     def _mask_credential(self, credential: str) -> str:
         s = credential.strip()
@@ -779,7 +796,18 @@ class OnchainTransferPage:
     def _refresh_progress_if_active(self, kind: str, row_key: str):
         task_progress.refresh_if_active(self, kind, row_key)
 
+    def _dispatch_ui(self, callback) -> None:
+        dispatch_ui_callback(self, callback)
+
+    def _schedule_tree_refresh(self) -> None:
+        schedule_ui_callback(self, "tree_refresh", self._refresh_tree, root=getattr(self, "root", None))
+
     def _finish_progress(self, kind: str, success: int, failed: int):
+        flush_queued_ui_renders(self)
+        log_tree = getattr(self, "log_tree", None)
+        if log_tree is not None:
+            flush_queued_log_rows(self, log_tree, max_rows=LOG_MAX_ROWS)
+        clear_ui_batch_size(self)
         task_progress.finish(self, kind, success, failed)
 
     def _set_progress_metrics(
@@ -794,17 +822,33 @@ class OnchainTransferPage:
     def _set_status(self, row_key: str, status: str):
         self._ensure_query_status_store().pop(row_key, None)
         self.row_status[row_key] = status
-        self._update_row_view(row_key)
+        queue_ui_render(self, lambda k=row_key: self._update_row_view(k), root=getattr(self, "root", None))
         self._refresh_progress_if_active("transfer", row_key)
 
     def _set_query_status(self, row_key: str, status: str):
         self._ensure_query_status_store()[row_key] = status
-        self._update_row_view(row_key)
+        queue_ui_render(self, lambda k=row_key: self._update_row_view(k), root=getattr(self, "root", None))
         self._refresh_progress_if_active("query", row_key)
 
     def _set_query_statuses(self, row_keys: list[str], status: str):
         for row_key in row_keys:
             self._set_query_status(row_key, status)
+
+    def _apply_source_balance_summary(self, context_sig: str, text: str) -> None:
+        if context_sig == self.source_credential_var.get().strip():
+            self.source_balance_var.set(text)
+
+    def _clear_source_balance_summary(self, context_sig: str) -> None:
+        if context_sig == self.source_credential_var.get().strip():
+            self.source_balance_var.set("-")
+
+    def _apply_target_balance_summary(self, context_sig: str, text: str) -> None:
+        if context_sig == self._normalize_context_target(self.target_address_var.get().strip()):
+            self.target_balance_var.set(text)
+
+    def _clear_target_balance_summary(self, context_sig: str) -> None:
+        if context_sig == self._normalize_context_target(self.target_address_var.get().strip()):
+            self.target_balance_var.set("-")
 
     def _active_row_keys(self) -> list[str]:
         if self._is_mode_m2m():
@@ -1338,7 +1382,7 @@ class OnchainTransferPage:
             self.target_balance_var.set("-")
             if not self.is_running:
                 task_progress.reset_metrics(self, amount_label="转账总额")
-            self._refresh_tree()
+            self._schedule_tree_refresh()
             return
         self.source_balance_var.set("-")
         if self._is_mode_m1():
@@ -1346,7 +1390,7 @@ class OnchainTransferPage:
             self.target_balance_var.set(self._balance_text_for_target(target) if target else "-")
             if not self.is_running:
                 task_progress.reset_metrics(self, amount_label="转账总额")
-            self._refresh_tree()
+            self._schedule_tree_refresh()
             return
         self.target_balance_var.set("-")
 
@@ -1467,11 +1511,11 @@ class OnchainTransferPage:
         try:
             token = self.client.get_erc20_token_info(network, contract)
             self.custom_tokens_by_network.setdefault(network, {})[token.contract.lower()] = token
-            self.root.after(0, lambda n=network, t=token: self._apply_found_token(n, t))
+            self._dispatch_ui(lambda n=network, t=token: self._apply_found_token(n, t))
         except Exception as exc:
             err_text = str(exc)
-            self.root.after(0, lambda m=f"合约搜索失败：{err_text}": self.log(m))
-            self.root.after(0, lambda e=err_text: messagebox.showerror("合约搜索失败", e))
+            self._dispatch_ui(lambda m=f"合约搜索失败：{err_text}": self.log(m))
+            self._dispatch_ui(lambda e=err_text: messagebox.showerror("合约搜索失败", e))
 
     def _apply_found_token(self, network: str, token: EvmToken):
         self.log(
@@ -1481,7 +1525,7 @@ class OnchainTransferPage:
             self._build_token_options(network=network, prefer_symbol=token.symbol, prefer_contract=token.contract)
 
     def log(self, text: str):
-        append_log_row(self.log_tree, text, max_rows=LOG_MAX_ROWS)
+        queue_log_row(self, self.log_tree, text, root=getattr(self, "root", None), max_rows=LOG_MAX_ROWS)
 
     def _parse_m2m_lines(self, lines: list[str]) -> list[OnchainPairEntry]:
         result: list[OnchainPairEntry] = []
@@ -2317,6 +2361,8 @@ class OnchainTransferPage:
 
     def _run_query_balance_for_sources(self, network: str, token: EvmToken, sources: list[str]):
         try:
+            set_ui_batch_size(self, self._runtime_worker_threads())
+            dispatch_ui = self._dispatch_ui
             symbol = token.symbol
             token_desc = symbol if token.is_native else f"{symbol}({self._short_contract(token.contract)})"
             row_keys_by_source = {k: list(v) for k, v in getattr(self, "_query_row_keys_by_source", {}).items()}
@@ -2327,13 +2373,10 @@ class OnchainTransferPage:
                     if src in sources:
                         row_keys_by_source.setdefault(src, []).append(self._m2m_key(item))
             progress_keys = self._unique_row_keys([key for src in sources for key in row_keys_by_source.get(src, [])])
-            self.root.after(0, lambda keys=progress_keys: self._begin_progress("query", keys))
-            self.root.after(0, lambda a=self._token_amount_text(symbol, Decimal("0")): self._set_progress_metrics(balance_text=a))
-            self.root.after(
-                0,
-                lambda keys=[key for src in sources for key in row_keys_by_source.get(src, [])]: self._set_query_statuses(keys, "waiting"),
-            )
-            self.root.after(0, lambda: self.log(f"开始查询余额：网络={network}，币种={token_desc}，钱包数={len(sources)}"))
+            dispatch_ui(lambda keys=progress_keys: self._begin_progress("query", keys))
+            dispatch_ui(lambda a=self._token_amount_text(symbol, Decimal("0")): self._set_progress_metrics(balance_text=a))
+            dispatch_ui(lambda keys=[key for src in sources for key in row_keys_by_source.get(src, [])]: self._set_query_statuses(keys, "waiting"))
+            dispatch_ui(lambda: self.log(f"开始查询余额：网络={network}，币种={token_desc}，钱包数={len(sources)}"))
             ok = 0
             failed = 0
             total = Decimal("0")
@@ -2351,7 +2394,7 @@ class OnchainTransferPage:
                         return
                     row_keys = list(row_keys_by_source.get(source, []))
                     prefix = f"[{i}/{len(sources)}]"
-                    self.root.after(0, lambda keys=row_keys: self._set_query_statuses(keys, "running"))
+                    dispatch_ui(lambda keys=row_keys: self._set_query_statuses(keys, "running"))
                     try:
                         _pk, addr = self._resolve_wallet(source)
                         if token.is_native:
@@ -2365,14 +2408,14 @@ class OnchainTransferPage:
                             ok += 1
                             balance_total_text = self._token_amount_text(symbol, total)
                         msg = f"{prefix}[{self._mask(addr, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(amount)}"
-                        self.root.after(0, lambda m=msg: self.log(m))
-                        self.root.after(0, lambda a=balance_total_text: self._set_progress_metrics(balance_text=a))
-                        self.root.after(0, lambda keys=row_keys: self._set_query_statuses(keys, "success"))
+                        dispatch_ui(lambda m=msg: self.log(m))
+                        dispatch_ui(lambda a=balance_total_text: self._set_progress_metrics(balance_text=a))
+                        dispatch_ui(lambda keys=row_keys: self._set_query_statuses(keys, "success"))
                     except Exception as exc:
                         with lock:
                             failed += 1
-                        self.root.after(0, lambda m=f"{prefix} 查询失败：{exc}": self.log(m))
-                        self.root.after(0, lambda keys=row_keys: self._set_query_statuses(keys, "failed"))
+                        dispatch_ui(lambda m=f"{prefix} 查询失败：{exc}": self.log(m))
+                        dispatch_ui(lambda keys=row_keys: self._set_query_statuses(keys, "failed"))
                     finally:
                         jobs.task_done()
 
@@ -2385,33 +2428,32 @@ class OnchainTransferPage:
             for t in workers:
                 t.join()
             summary = f"余额查询结束：成功 {ok}，失败 {failed}，{symbol} 合计={self._decimal_to_text(total)}"
-            self.root.after(0, lambda: self._refresh_tree())
-            self.root.after(0, lambda: self.log(summary))
-            self.root.after(0, lambda s=ok, f=failed: self._finish_progress("query", s, f))
+            dispatch_ui(lambda: self._refresh_tree())
+            dispatch_ui(lambda: self.log(summary))
+            dispatch_ui(lambda s=ok, f=failed: self._finish_progress("query", s, f))
         except Exception as exc:
             err_text = str(exc)
-            self.root.after(0, lambda m=f"余额查询任务异常终止：{err_text}": self.log(m))
-            self.root.after(0, lambda e=err_text: messagebox.showerror("执行异常", e))
-            self.root.after(0, lambda s=ok if "ok" in locals() else 0, f=failed if "failed" in locals() else 0: self._finish_progress("query", s, f))
+            dispatch_ui(lambda m=f"余额查询任务异常终止：{err_text}": self.log(m))
+            dispatch_ui(lambda e=err_text: messagebox.showerror("执行异常", e))
+            dispatch_ui(lambda s=ok if "ok" in locals() else 0, f=failed if "failed" in locals() else 0: self._finish_progress("query", s, f))
         finally:
             self._query_row_keys_by_source = {}
             self.is_running = False
 
     def _run_query_balance_one_to_many(self, network: str, token: EvmToken, source: str, targets: list[str]):
         try:
+            set_ui_batch_size(self, self._runtime_worker_threads())
+            dispatch_ui = self._dispatch_ui
             symbol = token.symbol
             token_desc = self._token_desc(token)
             src_count = 1 if source else 0
             context_sig = source.strip()
             row_keys_by_target = {target: self._one_to_many_key(target) for target in targets}
             self._mark_query_status_contexts(list(row_keys_by_target.values()), context_sig)
-            self.root.after(0, lambda keys=self._unique_row_keys(list(row_keys_by_target.values())): self._begin_progress("query", keys))
-            self.root.after(0, lambda a=self._token_amount_text(symbol, Decimal("0")): self._set_progress_metrics(balance_text=a))
-            self.root.after(0, lambda keys=list(row_keys_by_target.values()): self._set_query_statuses(keys, "waiting"))
-            self.root.after(
-                0,
-                lambda: self.log(f"开始查询余额：模式=1对多，网络={network}，币种={token_desc}，源钱包数={src_count}，目标地址数={len(targets)}"),
-            )
+            dispatch_ui(lambda keys=self._unique_row_keys(list(row_keys_by_target.values())): self._begin_progress("query", keys))
+            dispatch_ui(lambda a=self._token_amount_text(symbol, Decimal("0")): self._set_progress_metrics(balance_text=a))
+            dispatch_ui(lambda keys=list(row_keys_by_target.values()): self._set_query_statuses(keys, "waiting"))
+            dispatch_ui(lambda: self.log(f"开始查询余额：模式=1对多，网络={network}，币种={token_desc}，源钱包数={src_count}，目标地址数={len(targets)}"))
 
             # 先查询转出钱包余额，展示在私钥输入框旁
             source_addr = ""
@@ -2425,22 +2467,17 @@ class OnchainTransferPage:
                         src_units = self.client.get_erc20_balance(network, token.contract, source_addr)
                     src_amount = self._units_to_amount(src_units, token.decimals)
                     self.source_balance_cache[source] = src_amount
-                    if context_sig == self.source_credential_var.get().strip():
-                        src_text = f"{symbol}:{self._decimal_to_text(src_amount)}"
-                        self.root.after(0, lambda t=src_text: self.source_balance_var.set(t))
-                    self.root.after(
-                        0,
-                        lambda m=f"[SRC][{self._mask(source_addr, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(src_amount)}": self.log(m),
-                    )
+                    src_text = f"{symbol}:{self._decimal_to_text(src_amount)}"
+                    dispatch_ui(lambda c=context_sig, t=src_text: self._apply_source_balance_summary(c, t))
+                    dispatch_ui(lambda m=f"[SRC][{self._mask(source_addr, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(src_amount)}": self.log(m))
                     source_query_state = "ok"
                 except Exception as exc:
-                    if context_sig == self.source_credential_var.get().strip():
-                        self.root.after(0, lambda: self.source_balance_var.set("-"))
-                    self.root.after(0, lambda m=f"[SRC] 查询失败：{exc}": self.log(m))
+                    dispatch_ui(lambda c=context_sig: self._clear_source_balance_summary(c))
+                    dispatch_ui(lambda m=f"[SRC] 查询失败：{exc}": self.log(m))
                     source_query_state = "failed"
             else:
-                self.root.after(0, lambda: self.source_balance_var.set("-"))
-                self.root.after(0, lambda: self.log("[SRC] 未提供转出钱包，已跳过源钱包余额查询"))
+                dispatch_ui(lambda: self.source_balance_var.set("-"))
+                dispatch_ui(lambda: self.log("[SRC] 未提供转出钱包，已跳过源钱包余额查询"))
 
             ok = 0
             failed = 0
@@ -2450,7 +2487,7 @@ class OnchainTransferPage:
             for i, addr in enumerate(targets, start=1):
                 jobs.put((i, addr))
             if not targets:
-                self.root.after(0, lambda: self.log("[DST] 未提供目标地址，已跳过目标地址余额查询"))
+                dispatch_ui(lambda: self.log("[DST] 未提供目标地址，已跳过目标地址余额查询"))
 
             def worker():
                 nonlocal ok, failed, total
@@ -2463,7 +2500,7 @@ class OnchainTransferPage:
                     prefix = f"[{i}/{len(targets)}]"
                     if row_key:
                         self._mark_query_status_context(row_key, context_sig)
-                        self.root.after(0, lambda k=row_key: self._set_query_status(k, "running"))
+                        dispatch_ui(lambda k=row_key: self._set_query_status(k, "running"))
                     try:
                         if token.is_native:
                             units = self.client.get_balance_wei(network, addr)
@@ -2476,18 +2513,18 @@ class OnchainTransferPage:
                             ok += 1
                             balance_total_text = self._token_amount_text(symbol, total)
                         msg = f"{prefix}[{self._mask(addr, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(amount)}"
-                        self.root.after(0, lambda m=msg: self.log(m))
-                        self.root.after(0, lambda a=balance_total_text: self._set_progress_metrics(balance_text=a))
+                        dispatch_ui(lambda m=msg: self.log(m))
+                        dispatch_ui(lambda a=balance_total_text: self._set_progress_metrics(balance_text=a))
                         if row_key:
                             self._mark_query_status_context(row_key, context_sig)
-                            self.root.after(0, lambda k=row_key: self._set_query_status(k, "success"))
+                            dispatch_ui(lambda k=row_key: self._set_query_status(k, "success"))
                     except Exception as exc:
                         with lock:
                             failed += 1
-                        self.root.after(0, lambda m=f"{prefix} 查询失败：{exc}": self.log(m))
+                        dispatch_ui(lambda m=f"{prefix} 查询失败：{exc}": self.log(m))
                         if row_key:
                             self._mark_query_status_context(row_key, context_sig)
-                            self.root.after(0, lambda k=row_key: self._set_query_status(k, "failed"))
+                            dispatch_ui(lambda k=row_key: self._set_query_status(k, "failed"))
                     finally:
                         jobs.task_done()
 
@@ -2505,34 +2542,31 @@ class OnchainTransferPage:
                 f"余额查询结束：源钱包查询={src_status_text}，目标地址成功 {ok}，失败 {failed}，"
                 f"目标地址{symbol}合计={self._decimal_to_text(total)}"
             )
-            self.root.after(0, lambda: self._refresh_tree())
-            self.root.after(0, lambda: self.log(summary))
-            self.root.after(0, lambda s=ok, f=failed: self._finish_progress("query", s, f))
+            dispatch_ui(lambda: self._refresh_tree())
+            dispatch_ui(lambda: self.log(summary))
+            dispatch_ui(lambda s=ok, f=failed: self._finish_progress("query", s, f))
         except Exception as exc:
             err_text = str(exc)
-            self.root.after(0, lambda m=f"余额查询任务异常终止：{err_text}": self.log(m))
-            self.root.after(0, lambda e=err_text: messagebox.showerror("执行异常", e))
-            self.root.after(0, lambda s=ok if "ok" in locals() else 0, f=failed if "failed" in locals() else 0: self._finish_progress("query", s, f))
+            dispatch_ui(lambda m=f"余额查询任务异常终止：{err_text}": self.log(m))
+            dispatch_ui(lambda e=err_text: messagebox.showerror("执行异常", e))
+            dispatch_ui(lambda s=ok if "ok" in locals() else 0, f=failed if "failed" in locals() else 0: self._finish_progress("query", s, f))
         finally:
             self.is_running = False
 
     def _run_query_balance_many_to_one(self, network: str, token: EvmToken, target: str, sources: list[str]):
         try:
+            set_ui_batch_size(self, self._runtime_worker_threads())
+            dispatch_ui = self._dispatch_ui
             symbol = token.symbol
             token_desc = self._token_desc(token)
             target_count = 1 if target else 0
             context_sig = self._normalize_context_target(target)
             row_keys_by_source = {source: self._many_to_one_key(source) for source in sources}
             self._mark_query_status_contexts(list(row_keys_by_source.values()), context_sig)
-            self.root.after(0, lambda keys=self._unique_row_keys(list(row_keys_by_source.values())): self._begin_progress("query", keys))
-            self.root.after(0, lambda a=self._token_amount_text(symbol, Decimal("0")): self._set_progress_metrics(balance_text=a))
-            self.root.after(0, lambda keys=list(row_keys_by_source.values()): self._set_query_statuses(keys, "waiting"))
-            self.root.after(
-                0,
-                lambda: self.log(
-                    f"开始查询余额：模式=多对1，网络={network}，币种={token_desc}，收款地址数={target_count}，源钱包数={len(sources)}"
-                ),
-            )
+            dispatch_ui(lambda keys=self._unique_row_keys(list(row_keys_by_source.values())): self._begin_progress("query", keys))
+            dispatch_ui(lambda a=self._token_amount_text(symbol, Decimal("0")): self._set_progress_metrics(balance_text=a))
+            dispatch_ui(lambda keys=list(row_keys_by_source.values()): self._set_query_statuses(keys, "waiting"))
+            dispatch_ui(lambda: self.log(f"开始查询余额：模式=多对1，网络={network}，币种={token_desc}，收款地址数={target_count}，源钱包数={len(sources)}"))
 
             target_query_state = "skip"
             if target:
@@ -2543,22 +2577,17 @@ class OnchainTransferPage:
                         target_units = self.client.get_erc20_balance(network, token.contract, target)
                     target_amount = self._units_to_amount(target_units, token.decimals)
                     self.target_balance_cache[target] = target_amount
-                    if context_sig == self._normalize_context_target(self.target_address_var.get().strip()):
-                        target_text = f"{symbol}:{self._decimal_to_text(target_amount)}"
-                        self.root.after(0, lambda t=target_text: self.target_balance_var.set(t))
-                    self.root.after(
-                        0,
-                        lambda m=f"[DST][{self._mask(target, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(target_amount)}": self.log(m),
-                    )
+                    target_text = f"{symbol}:{self._decimal_to_text(target_amount)}"
+                    dispatch_ui(lambda c=context_sig, t=target_text: self._apply_target_balance_summary(c, t))
+                    dispatch_ui(lambda m=f"[DST][{self._mask(target, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(target_amount)}": self.log(m))
                     target_query_state = "ok"
                 except Exception as exc:
-                    if context_sig == self._normalize_context_target(self.target_address_var.get().strip()):
-                        self.root.after(0, lambda: self.target_balance_var.set("-"))
-                    self.root.after(0, lambda m=f"[DST] 查询失败：{exc}": self.log(m))
+                    dispatch_ui(lambda c=context_sig: self._clear_target_balance_summary(c))
+                    dispatch_ui(lambda m=f"[DST] 查询失败：{exc}": self.log(m))
                     target_query_state = "failed"
             else:
-                self.root.after(0, lambda: self.target_balance_var.set("-"))
-                self.root.after(0, lambda: self.log("[DST] 未提供收款地址，已跳过收款地址余额查询"))
+                dispatch_ui(lambda: self.target_balance_var.set("-"))
+                dispatch_ui(lambda: self.log("[DST] 未提供收款地址，已跳过收款地址余额查询"))
 
             ok = 0
             failed = 0
@@ -2568,7 +2597,7 @@ class OnchainTransferPage:
             for i, source in enumerate(sources, start=1):
                 jobs.put((i, source))
             if not sources:
-                self.root.after(0, lambda: self.log("[SRC] 未提供源钱包，已跳过源钱包余额查询"))
+                dispatch_ui(lambda: self.log("[SRC] 未提供源钱包，已跳过源钱包余额查询"))
 
             def worker():
                 nonlocal ok, failed, total
@@ -2581,7 +2610,7 @@ class OnchainTransferPage:
                     prefix = f"[{i}/{len(sources)}]"
                     if row_key:
                         self._mark_query_status_context(row_key, context_sig)
-                        self.root.after(0, lambda k=row_key: self._set_query_status(k, "running"))
+                        dispatch_ui(lambda k=row_key: self._set_query_status(k, "running"))
                     try:
                         _pk, addr = self._resolve_wallet(source)
                         if token.is_native:
@@ -2595,18 +2624,18 @@ class OnchainTransferPage:
                             ok += 1
                             balance_total_text = self._token_amount_text(symbol, total)
                         msg = f"{prefix}[{self._mask(addr, head=8, tail=6)}] 余额={symbol} {self._decimal_to_text(amount)}"
-                        self.root.after(0, lambda m=msg: self.log(m))
-                        self.root.after(0, lambda a=balance_total_text: self._set_progress_metrics(balance_text=a))
+                        dispatch_ui(lambda m=msg: self.log(m))
+                        dispatch_ui(lambda a=balance_total_text: self._set_progress_metrics(balance_text=a))
                         if row_key:
                             self._mark_query_status_context(row_key, context_sig)
-                            self.root.after(0, lambda k=row_key: self._set_query_status(k, "success"))
+                            dispatch_ui(lambda k=row_key: self._set_query_status(k, "success"))
                     except Exception as exc:
                         with lock:
                             failed += 1
-                        self.root.after(0, lambda m=f"{prefix} 查询失败：{exc}": self.log(m))
+                        dispatch_ui(lambda m=f"{prefix} 查询失败：{exc}": self.log(m))
                         if row_key:
                             self._mark_query_status_context(row_key, context_sig)
-                            self.root.after(0, lambda k=row_key: self._set_query_status(k, "failed"))
+                            dispatch_ui(lambda k=row_key: self._set_query_status(k, "failed"))
                     finally:
                         jobs.task_done()
 
@@ -2624,14 +2653,14 @@ class OnchainTransferPage:
                 f"余额查询结束：收款地址查询={dst_status_text}，源钱包成功 {ok}，失败 {failed}，"
                 f"源钱包{symbol}合计={self._decimal_to_text(total)}"
             )
-            self.root.after(0, lambda: self._refresh_tree())
-            self.root.after(0, lambda: self.log(summary))
-            self.root.after(0, lambda s=ok, f=failed: self._finish_progress("query", s, f))
+            dispatch_ui(lambda: self._refresh_tree())
+            dispatch_ui(lambda: self.log(summary))
+            dispatch_ui(lambda s=ok, f=failed: self._finish_progress("query", s, f))
         except Exception as exc:
             err_text = str(exc)
-            self.root.after(0, lambda m=f"余额查询任务异常终止：{err_text}": self.log(m))
-            self.root.after(0, lambda e=err_text: messagebox.showerror("执行异常", e))
-            self.root.after(0, lambda s=ok if "ok" in locals() else 0, f=failed if "failed" in locals() else 0: self._finish_progress("query", s, f))
+            dispatch_ui(lambda m=f"余额查询任务异常终止：{err_text}": self.log(m))
+            dispatch_ui(lambda e=err_text: messagebox.showerror("执行异常", e))
+            dispatch_ui(lambda s=ok if "ok" in locals() else 0, f=failed if "failed" in locals() else 0: self._finish_progress("query", s, f))
         finally:
             self.is_running = False
 
@@ -2820,15 +2849,8 @@ class OnchainTransferPage:
 
     def _run_batch_transfer(self, jobs_data: list[tuple[str, str, str]], params: WithdrawRuntimeParams, dry_run: bool):
         try:
-            def dispatch_ui(callback) -> None:
-                try:
-                    self.root.after(0, callback)
-                except Exception:
-                    try:
-                        callback()
-                    except Exception:
-                        pass
-
+            set_ui_batch_size(self, params.threads)
+            dispatch_ui = self._dispatch_ui
             def job_prefix(index: int) -> str:
                 return f"[{index}/{len(jobs_data)}]"
 

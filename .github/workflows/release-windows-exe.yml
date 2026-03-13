@@ -25,11 +25,11 @@ jobs:
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller
+          pip install -r requirements-runtime.txt pyinstaller
 
       - name: Build EXE (windowed, no console)
         run: |
-          pyinstaller --noconfirm --clean --windowed --name jiaoyisuopiliang main.py
+          pyinstaller --noconfirm --clean --windowed --name jiaoyisuopiliang --collect-submodules eth_account --collect-submodules eth_utils main.py
 
       - name: Package ZIP
         shell: pwsh

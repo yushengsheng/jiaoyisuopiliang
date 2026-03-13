@@ -3,20 +3,32 @@
 
 from __future__ import annotations
 
-import queue
-import random
-import re
 import threading
-import time
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, W, Y, BooleanVar, DoubleVar, Frame as TkFrame, Menu, Scrollbar, StringVar
+from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, W, BooleanVar, DoubleVar, Frame as TkFrame, Menu, StringVar
 from tkinter import messagebox, ttk
 
-from api_clients import BitgetClient, SubmissionUncertainError
+from api_clients import BitgetClient
 from app_paths import BG_DATA_FILE
+import bitget_tasks
 from core_models import WithdrawRuntimeParams
-from shared_utils import LOG_MAX_ROWS, append_log_row, decimal_to_text, make_scrollbar, mask_text, random_decimal_between
+import network_options
+from shared_utils import (
+    LOG_MAX_ROWS,
+    clear_ui_batch_size,
+    decimal_to_text,
+    dispatch_ui_callback,
+    flush_queued_log_rows,
+    flush_queued_ui_renders,
+    make_scrollbar,
+    mask_text,
+    parse_worker_threads,
+    queue_log_row,
+    queue_ui_render,
+    random_decimal_between,
+    schedule_ui_callback,
+)
 from stores import BgOneToManyStore
 from table_import_utils import IMPORT_TARGET_PURPLE, column_name_from_identifier, heading_text, update_import_target_bar
 import task_progress
@@ -52,7 +64,7 @@ class BitgetOneToManyPage:
         self.random_min_var = StringVar(value="")
         self.random_max_var = StringVar(value="")
         self.delay_var = DoubleVar(value=1.0)
-        self.threads_var = StringVar(value="2")
+        self.threads_var = StringVar(value="5")
         self.dry_run_var = BooleanVar(value=True)
         self.api_key_var = StringVar(value="")
         self.api_secret_var = StringVar(value="")
@@ -175,8 +187,7 @@ class BitgetOneToManyPage:
 
         action2 = ttk.Frame(main)
         action2.pack(fill="x", pady=(0, 10))
-        ttk.Button(action2, text="按余额刷新币种", command=self.start_refresh_coin_options).pack(side=LEFT)
-        ttk.Button(action2, text="查询余额（全币种）", command=self.start_query_balance).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(action2, text="查询余额（全币种）", command=self.start_query_balance).pack(side=LEFT)
         self.lbl_progress = ttk.Label(action2, textvariable=self.progress_var, style="Subtle.TLabel", anchor="w", justify="left")
         self.lbl_progress.pack(side=LEFT, fill="x", expand=True, padx=(10, 0))
         ttk.Button(action2, text="执行批量提现", style="Action.TButton", command=self.start_batch_withdraw).pack(side=RIGHT)
@@ -285,6 +296,10 @@ class BitgetOneToManyPage:
             return ""
         return self.api_key_var.get().strip()
 
+    def _runtime_worker_threads(self) -> int:
+        raw = self.threads_var.get() if hasattr(self, "threads_var") else 5
+        return parse_worker_threads(raw, default=5)
+
     def _source_context_matches(self, context_sig: str) -> bool:
         if not hasattr(self, "api_key_var"):
             return True
@@ -308,7 +323,7 @@ class BitgetOneToManyPage:
         self.query_status = {}
         if not self.is_running:
             task_progress.reset_metrics(self, amount_label="提现总额")
-        self._refresh_tree()
+        self._schedule_tree_refresh()
 
     def _display_status(self, key: str) -> str:
         query_status = getattr(self, "query_status", {})
@@ -371,7 +386,18 @@ class BitgetOneToManyPage:
     def _refresh_progress_if_active(self, kind: str, row_key: str):
         task_progress.refresh_if_active(self, kind, row_key)
 
+    def _dispatch_ui(self, callback) -> None:
+        dispatch_ui_callback(self, callback)
+
+    def _schedule_tree_refresh(self) -> None:
+        schedule_ui_callback(self, "tree_refresh", self._refresh_tree, root=getattr(self, "root", None))
+
     def _finish_progress(self, kind: str, success: int, failed: int):
+        flush_queued_ui_renders(self)
+        log_tree = getattr(self, "log_tree", None)
+        if log_tree is not None:
+            flush_queued_log_rows(self, log_tree, max_rows=LOG_MAX_ROWS)
+        clear_ui_batch_size(self)
         task_progress.finish(self, kind, success, failed)
 
     def _set_progress_metrics(
@@ -393,33 +419,30 @@ class BitgetOneToManyPage:
             self.address_status = {}
         self.query_status.pop(addr, None)
         self.address_status[addr] = status
-        row_id = self.row_id_by_addr.get(addr)
-        if row_id and row_id in self.row_index_map:
-            values = list(self.tree.item(row_id, "values"))
-            if len(values) >= 5:
-                values[3] = self._status_text(addr)
-                self.tree.item(row_id, values=values)
-            tag = self._status_tag(status)
-            self.tree.item(row_id, tags=(tag,) if tag else ())
+        queue_ui_render(self, lambda a=addr: self._refresh_row_view(a), root=getattr(self, "root", None))
         self._refresh_progress_if_active("withdraw", addr)
 
     def _set_query_status(self, key: str, status: str):
         if not hasattr(self, "query_status"):
             self.query_status = {}
         self.query_status[key] = status
-        row_id = self.row_id_by_addr.get(key)
-        if row_id and row_id in self.row_index_map:
-            values = list(self.tree.item(row_id, "values"))
-            if len(values) >= 5:
-                values[3] = self._status_text(key)
-                self.tree.item(row_id, values=values)
-            tag = self._status_tag(self._display_status(key))
-            self.tree.item(row_id, tags=(tag,) if tag else ())
+        queue_ui_render(self, lambda a=key: self._refresh_row_view(a), root=getattr(self, "root", None))
         self._refresh_progress_if_active("query", key)
 
     def _set_query_statuses(self, keys: list[str], status: str):
         for key in task_progress.unique_keys(keys):
             self._set_query_status(key, status)
+
+    def _refresh_row_view(self, addr: str) -> None:
+        row_id = self.row_id_by_addr.get(addr)
+        if not row_id or row_id not in self.row_index_map:
+            return
+        values = list(self.tree.item(row_id, "values"))
+        if len(values) >= 5:
+            values[3] = self._status_text(addr)
+            self.tree.item(row_id, values=values)
+        tag = self._status_tag(self._display_status(addr))
+        self.tree.item(row_id, tags=(tag,) if tag else ())
 
     def _balance_text(self) -> str:
         return self._totals_to_text(self.source_asset_cache)
@@ -593,7 +616,7 @@ class BitgetOneToManyPage:
         return idxs[0]
 
     def log(self, text: str):
-        append_log_row(self.log_tree, text, max_rows=LOG_MAX_ROWS)
+        queue_log_row(self, self.log_tree, text, root=getattr(self, "root", None), max_rows=LOG_MAX_ROWS)
 
     def _parse_address_lines(self, lines: list[str]) -> list[str]:
         arr: list[str] = []
@@ -729,8 +752,9 @@ class BitgetOneToManyPage:
         cred = self._source_cred(with_message=True)
         if not cred:
             return
+        selected_coin = self.coin_var.get().strip().upper() or "USDT"
         self.is_running = True
-        threading.Thread(target=self._run_query_balance, args=(cred,), daemon=True).start()
+        threading.Thread(target=self._run_query_balance, args=(cred, selected_coin), daemon=True).start()
 
     def start_withdraw_current_row(self):
         idx = self._single_selected_index()
@@ -877,40 +901,13 @@ class BitgetOneToManyPage:
         return k, s, p
 
     def start_refresh_network_options(self):
-        coin = self.coin_var.get().strip().upper()
-        if not coin:
-            self.network_box.configure(values=[""])
-            self.network_var.set("")
-            return
-        cached = self.coin_network_cache.get(coin)
-        if cached is not None:
-            self._apply_network_options(coin, cached, cache_result=True)
-            return
-        self.network_box.configure(values=[""])
-        self.network_var.set("")
-        threading.Thread(target=self._run_refresh_network_options, args=(coin,), daemon=True).start()
+        network_options.start_coin_network_refresh(self)
 
     def _run_refresh_network_options(self, coin: str):
-        try:
-            arr = self.client.get_coin_networks(coin)
-            self.root.after(0, lambda c=coin, x=arr: self._apply_network_options(c, x, cache_result=True))
-        except Exception as exc:
-            self.root.after(0, lambda m=f"{coin} 网络读取失败：{exc}": self.log(m))
-            self.root.after(0, lambda c=coin: self._apply_network_options(c, [], cache_result=False))
+        network_options.run_coin_network_refresh(self, coin)
 
     def _apply_network_options(self, coin: str, networks: list[str], cache_result: bool):
-        arr = [x.strip() for x in networks if x and x.strip()]
-        if cache_result:
-            self.coin_network_cache[coin] = arr
-        if self.coin_var.get().strip().upper() != coin:
-            return
-        values = [""] + arr
-        self.network_box.configure(values=values)
-        current = self.network_var.get().strip()
-        if current and current in values:
-            self.network_var.set(current)
-        elif current and current not in values:
-            self.network_var.set("")
+        network_options.apply_coin_network_options(self, coin, networks, cache_result)
 
     def _update_coin_options(self, totals: dict[str, Decimal]):
         ranked = sorted(totals.items(), key=lambda x: (-x[1], x[0]))
@@ -927,39 +924,6 @@ class BitgetOneToManyPage:
         else:
             self.coin_var.set(options[0])
 
-    def start_refresh_coin_options(self):
-        if self.is_running:
-            messagebox.showwarning("提示", "已有任务在运行")
-            return
-        cred = self._source_cred(with_message=True)
-        if not cred:
-            return
-        self.is_running = True
-        threading.Thread(target=self._run_refresh_coin_options, args=(cred,), daemon=True).start()
-
-    def _run_refresh_coin_options(self, cred: tuple[str, str, str]):
-        try:
-            k, s, p = cred
-            self.root.after(0, lambda: self.log("开始按余额刷新币种"))
-            totals = self.client.get_account_assets(k, s, p)
-            self.root.after(
-                0,
-                lambda c=k.strip(), d=dict(totals): self._apply_source_assets(c, d, update_coin_options=True),
-            )
-            ranked = sorted(totals.items(), key=lambda x: (-x[1], x[0]))
-            if ranked:
-                top = ", ".join([f"{c}={self._decimal_to_text(v)}" for c, v in ranked[:8]])
-                summary = f"币种刷新结束：可用币种 {len(ranked)}；Top: {top}"
-            else:
-                summary = "币种刷新结束：未发现可用余额币种"
-            self.root.after(0, lambda: self.log(summary))
-        except Exception as exc:
-            err_text = str(exc)
-            self.root.after(0, lambda m=f"币种刷新失败：{err_text}": self.log(m))
-            self.root.after(0, lambda e=err_text: messagebox.showerror("执行异常", e))
-        finally:
-            self.is_running = False
-
     def start_query_balance(self):
         if self.is_running:
             messagebox.showwarning("提示", "已有任务在运行")
@@ -967,43 +931,12 @@ class BitgetOneToManyPage:
         cred = self._source_cred(with_message=True)
         if not cred:
             return
+        selected_coin = self.coin_var.get().strip().upper() or "USDT"
         self.is_running = True
-        threading.Thread(target=self._run_query_balance, args=(cred,), daemon=True).start()
+        threading.Thread(target=self._run_query_balance, args=(cred, selected_coin), daemon=True).start()
 
-    def _run_query_balance(self, cred: tuple[str, str, str]):
-        try:
-            k, s, p = cred
-            query_key = f"source:{k}"
-            context_sig = k.strip()
-            selected_coin = self.coin_var.get().strip().upper() or "USDT"
-            self.root.after(0, lambda: self._begin_progress("query", [query_key]))
-            self.root.after(0, lambda a=self._coin_amount_text(selected_coin, Decimal("0")): self._set_progress_metrics(balance_text=a))
-            self.root.after(0, lambda q=query_key: self._set_query_status(q, "waiting"))
-            self.root.after(0, lambda: self.log("开始查询余额（全币种）"))
-            self.root.after(0, lambda q=query_key: self._set_query_status(q, "running"))
-            totals = self.client.get_account_assets(k, s, p)
-            self.root.after(
-                0,
-                lambda c=context_sig, d=dict(totals): self._apply_source_assets(c, d, update_coin_options=False),
-            )
-            balance_total = totals.get(selected_coin, Decimal("0"))
-            self.root.after(
-                0,
-                lambda c=context_sig, a=self._coin_amount_text(selected_coin, balance_total): self._apply_query_balance_metrics(c, a),
-            )
-            summary = f"余额查询结束：{self._totals_to_text(totals)}"
-            self.root.after(0, lambda: self.log(summary))
-            self.root.after(0, lambda q=query_key: self._set_query_status(q, "success"))
-            self.root.after(0, lambda: self._finish_progress("query", 1, 0))
-        except Exception as exc:
-            err_text = str(exc)
-            self.root.after(0, lambda m=f"余额查询失败：{err_text}": self.log(m))
-            self.root.after(0, lambda e=err_text: messagebox.showerror("执行异常", e))
-            if "k" in locals():
-                self.root.after(0, lambda q=f"source:{k}": self._set_query_status(q, "failed"))
-            self.root.after(0, lambda: self._finish_progress("query", 0, 1))
-        finally:
-            self.is_running = False
+    def _run_query_balance(self, cred: tuple[str, str, str], selected_coin: str):
+        bitget_tasks.run_query_balance(self, cred, selected_coin)
 
     @classmethod
     def _random_decimal_between(cls, low: Decimal, high: Decimal) -> Decimal:
@@ -1182,205 +1115,4 @@ class BitgetOneToManyPage:
         threading.Thread(target=self._run_withdraw, args=(addrs, params, cred, dry_run), daemon=True).start()
 
     def _run_withdraw(self, addrs: list[str], params: WithdrawRuntimeParams, cred: tuple[str, str, str], dry_run: bool):
-        try:
-            def dispatch_ui(callback) -> None:
-                try:
-                    self.root.after(0, callback)
-                except Exception:
-                    try:
-                        callback()
-                    except Exception:
-                        pass
-
-            def job_prefix(index: int, addr: str) -> str:
-                return f"[{index}/{len(addrs)}][{self._mask(addr, head=8, tail=6)}]"
-
-            amount_view = params.amount
-            source_context = cred[0].strip()
-            track_amount_total = not (dry_run and params.amount == self.AMOUNT_ALL_LABEL)
-            if not hasattr(self, "address_status_context"):
-                self.address_status_context = {}
-            if params.random_enabled and params.random_min is not None and params.random_max is not None:
-                amount_view = f"random({params.random_min:.2f}~{params.random_max:.2f})"
-            withdraw_fee: Decimal | None = None
-            if not dry_run:
-                try:
-                    withdraw_fee = self.client.get_withdraw_fee(params.coin, params.network)
-                except Exception as exc:
-                    dispatch_ui(lambda m=f"{params.coin}/{params.network} 手续费读取失败：{exc}": self.log(m))
-            dispatch_ui(lambda keys=addrs: self._begin_progress("withdraw", keys))
-            dispatch_ui(
-                lambda a=self._coin_amount_text(params.coin, Decimal("0")), g=(
-                    self._coin_amount_text(params.coin, Decimal("0")) if withdraw_fee is not None else "-"
-                ), amt_known=track_amount_total: self._set_progress_metrics(amount_text=(a if amt_known else "-"), gas_text=g),
-            )
-            dispatch_ui(
-                lambda: self.log(
-                    f"开始批量提现：地址数={len(addrs)}, coin={params.coin}, amount={amount_view}, "
-                    f"network={params.network}, delay={params.delay}, threads={params.threads}, dry_run={dry_run}"
-                ),
-            )
-            fallback_prefixes: dict[str, str] = {}
-            for addr in addrs:
-                fallback_prefixes[addr] = job_prefix(len(fallback_prefixes) + 1, addr)
-                self.address_status_context[addr] = source_context
-                dispatch_ui(lambda a=addr: self._set_status(a, "waiting"))
-
-            success = 0
-            failed = 0
-            resolved = 0
-            lock = threading.Lock()
-            resolved_event = threading.Event()
-            resolved_addrs: set[str] = set()
-            jobs: queue.Queue[tuple[int, str]] = queue.Queue()
-            for i, addr in enumerate(addrs, start=1):
-                jobs.put((i, addr))
-
-            def finalize_result(addr: str, result_status: str, msg: str, *, amount_text: str = "") -> None:
-                nonlocal success, failed, resolved, total_amount, total_fee
-                with lock:
-                    if addr in resolved_addrs:
-                        return
-                    resolved_addrs.add(addr)
-                    if result_status == "success":
-                        success += 1
-                        if track_amount_total:
-                            try:
-                                total_amount += Decimal(amount_text)
-                            except Exception:
-                                pass
-                        if withdraw_fee is not None:
-                            total_fee += withdraw_fee
-                    else:
-                        failed += 1
-                    amount_total_text = self._coin_amount_text(params.coin, total_amount) if track_amount_total else "-"
-                    gas_total_text = self._coin_amount_text(params.coin, total_fee) if withdraw_fee is not None else "-"
-                    resolved += 1
-                    done = resolved >= len(addrs)
-                if done:
-                    resolved_event.set()
-                dispatch_ui(lambda m=msg: self.log(m))
-                self.address_status_context[addr] = source_context
-                dispatch_ui(lambda a=addr, s=result_status: self._set_status(a, s))
-                dispatch_ui(lambda a=amount_total_text, g=gas_total_text: self._set_progress_metrics(amount_text=a, gas_text=g))
-
-            def schedule_submitted_timeout(addr: str, prefix: str, submitted_timeout_seconds: float) -> None:
-                timeout_msg = f"{prefix} 确认中超过 {submitted_timeout_seconds:g} 秒，自动判定失败"
-
-                def timeout_worker():
-                    if submitted_timeout_seconds > 0:
-                        time.sleep(submitted_timeout_seconds)
-                    finalize_result(addr, "failed", timeout_msg)
-
-                if submitted_timeout_seconds > 0:
-                    threading.Thread(target=timeout_worker, daemon=True).start()
-                else:
-                    timeout_worker()
-
-            def worker():
-                while True:
-                    try:
-                        i, addr = jobs.get_nowait()
-                    except queue.Empty:
-                        return
-                    prefix = job_prefix(i, addr)
-                    result_status = "failed"
-                    msg = ""
-                    amount_text = ""
-                    order_id = ""
-                    self.address_status_context[addr] = source_context
-                    dispatch_ui(lambda a=addr: self._set_status(a, "running"))
-                    submitted_timeout_seconds = max(0.0, float(getattr(self, "submitted_timeout_seconds", SUBMITTED_TIMEOUT_SECONDS)))
-                    try:
-                        amount = self._resolve_amount(params, cred, dry_run=dry_run)
-                        amount_text = str(amount)
-                        if dry_run:
-                            msg = f"{prefix} 模拟成功 -> {params.coin} {amount}"
-                            result_status = "success"
-                        else:
-                            k, s, p = cred
-                            new_client_oid = getattr(self.client, "new_client_oid", None)
-                            client_oid = (
-                                new_client_oid()
-                                if callable(new_client_oid)
-                                else f"codex_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
-                            )
-                            try:
-                                resp = self.client.withdraw(
-                                    k,
-                                    s,
-                                    p,
-                                    coin=params.coin,
-                                    address=addr,
-                                    amount=amount,
-                                    chain=params.network,
-                                    client_oid=client_oid,
-                                )
-                            except SubmissionUncertainError as exc:
-                                msg = f"{prefix} 提现确认中：未拿到 orderId，{exc}"
-                                result_status = "submitted"
-                            else:
-                                order_id = str(resp.get("orderId", "") or "")
-                                if order_id:
-                                    msg = f"{prefix} 提现成功 -> {params.coin} {amount}，orderId={order_id}"
-                                    result_status = "success"
-                                else:
-                                    msg = f"{prefix} 提现确认中：接口未返回 orderId"
-                                    result_status = "submitted"
-                    except Exception as exc:
-                        msg = f"{prefix} 提现失败：{exc}"
-                    finally:
-                        jobs.task_done()
-
-                    if result_status == "submitted":
-                        dispatch_ui(lambda m=msg: self.log(m))
-                        self.address_status_context[addr] = source_context
-                        dispatch_ui(lambda a=addr: self._set_status(a, "submitted"))
-                        schedule_submitted_timeout(addr, prefix, submitted_timeout_seconds)
-                    else:
-                        finalize_result(addr, result_status, msg, amount_text=amount_text)
-                    if params.delay > 0:
-                        time.sleep(params.delay)
-
-            total_amount = Decimal("0")
-            total_fee = Decimal("0")
-            workers: list[threading.Thread] = []
-            worker_count = max(1, min(params.threads, len(addrs)))
-            for _ in range(worker_count):
-                t = threading.Thread(target=worker, daemon=True)
-                t.start()
-                workers.append(t)
-            for t in workers:
-                t.join()
-            batch_finalize_timeout_seconds = max(
-                0.2,
-                max(0.0, float(getattr(self, "submitted_timeout_seconds", SUBMITTED_TIMEOUT_SECONDS))) + 1.0,
-            )
-            if len(addrs) == 0:
-                resolved_event.set()
-            if not resolved_event.wait(batch_finalize_timeout_seconds):
-                with lock:
-                    pending_addrs = [addr for addr in addrs if addr not in resolved_addrs]
-                for addr in pending_addrs:
-                    prefix = fallback_prefixes.get(addr, "")
-                    timeout_msg = f"{prefix} 任务收尾超时，自动判定失败" if prefix else "任务收尾超时，自动判定失败"
-                    finalize_result(addr, "failed", timeout_msg)
-
-            amount_total_text = self._coin_amount_text(params.coin, total_amount) if track_amount_total else "-"
-            gas_total_text = self._coin_amount_text(params.coin, total_fee) if withdraw_fee is not None else "-"
-            summary = (
-                f"Bitget 提现任务结束：成功 {success}，失败 {failed}，"
-                f"提现总额={amount_total_text}，gas合计={gas_total_text}"
-            )
-            dispatch_ui(lambda: self.log(summary))
-            dispatch_ui(lambda: messagebox.showinfo("执行完成", summary))
-            dispatch_ui(lambda s=success, f=failed: self._finish_progress("withdraw", s, f))
-        except Exception as exc:
-            err_text = str(exc)
-            dispatch_ui(lambda m=f"Bitget 提现任务异常终止：{err_text}": self.log(m))
-            dispatch_ui(lambda e=err_text: messagebox.showerror("执行异常", e))
-            dispatch_ui(
-                lambda s=success if "success" in locals() else 0, f=failed if "failed" in locals() else 0: self._finish_progress("withdraw", s, f),
-            )
-        finally:
-            self.is_running = False
+        bitget_tasks.run_withdraw(self, addrs, params, cred, dry_run)

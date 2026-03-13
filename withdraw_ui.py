@@ -8,6 +8,7 @@ from tkinter import ttk
 
 from page_bitget import BitgetOneToManyPage
 from page_onchain import OnchainTransferPage
+from shared_utils import bind_paste_shortcuts
 from table_import_utils import IMPORT_TARGET_PURPLE
 
 
@@ -50,7 +51,7 @@ def build_ui(app) -> None:
 
     app.lbl_coin = ttk.Label(setting, text="提现币种*")
     app.coin_box = ttk.Combobox(setting, textvariable=app.coin_var, width=12)
-    app.coin_box.configure(values=["USDT"])
+    app.coin_box.configure(values=app.DEFAULT_COIN_OPTIONS)
 
     app.lbl_network = ttk.Label(setting, text="提现网络")
     app.network_box = ttk.Combobox(setting, textvariable=app.network_var, values=app.NETWORK_OPTIONS, width=14)
@@ -82,6 +83,8 @@ def build_ui(app) -> None:
     app.ent_source_api_key = ttk.Entry(setting, textvariable=app.source_api_key_var, width=36)
     app.lbl_source_api_secret = ttk.Label(setting, text="提现账号API Secret*")
     app.ent_source_api_secret = ttk.Entry(setting, textvariable=app.source_api_secret_var, width=36, show="*")
+    bind_paste_shortcuts(app.ent_source_api_key)
+    bind_paste_shortcuts(app.ent_source_api_secret)
     app.lbl_source_balance_title = ttk.Label(setting, text="提现账号余额")
     app.lbl_source_balance_val = ttk.Label(setting, textvariable=app.source_balance_var, style="Value.TLabel")
     app._apply_setting_layout(compact=False)
@@ -158,8 +161,7 @@ def build_ui(app) -> None:
 
     action2 = ttk.Frame(main)
     action2.pack(fill="x", pady=(0, 10))
-    ttk.Button(action2, text="按余额刷新币种", command=app.start_refresh_coin_options).pack(side=LEFT)
-    ttk.Button(action2, text="查询余额（全币种）", command=app.start_query_balance).pack(side=LEFT, padx=(8, 0))
+    ttk.Button(action2, text="查询余额（全币种）", command=app.start_query_balance).pack(side=LEFT)
     app.lbl_progress = ttk.Label(action2, textvariable=app.progress_var, style="Subtle.TLabel", anchor="w", justify="left")
     app.lbl_progress.pack(side=LEFT, fill="x", expand=True, padx=(10, 0))
     ttk.Button(action2, text="执行批量提现", style="Action.TButton", command=app.start_batch_withdraw).pack(side=RIGHT)

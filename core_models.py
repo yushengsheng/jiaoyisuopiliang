@@ -20,7 +20,7 @@ class GlobalSettings:
     network: str = ""
     amount: str = ""
     delay_seconds: float = 1.0
-    worker_threads: int = 2
+    worker_threads: int = 5
     mode: str = "M2M"
     random_amount_enabled: bool = False
     random_amount_min: str = ""
@@ -52,7 +52,7 @@ class BgOneToManySettings:
     random_min: str = ""
     random_max: str = ""
     delay_seconds: float = 1.0
-    worker_threads: int = 2
+    worker_threads: int = 5
     dry_run: bool = True
     api_key: str = ""
     api_secret: str = ""
@@ -84,8 +84,7 @@ class OnchainSettings:
     random_min: str = ""
     random_max: str = ""
     delay_seconds: float = 1.0
-    worker_threads: int = 2
+    worker_threads: int = 10
     dry_run: bool = True
     one_to_many_source: str = ""
     many_to_one_target: str = ""
-

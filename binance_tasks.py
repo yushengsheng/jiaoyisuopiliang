@@ -12,21 +12,15 @@ from tkinter import messagebox
 
 from api_clients import SubmissionUncertainError
 from core_models import AccountEntry, WithdrawRuntimeParams
+from shared_utils import dispatch_ui_callback, set_ui_batch_size
 
 SUBMITTED_TIMEOUT_SECONDS = 10.0
 
 
 def run_withdraw(app, accounts: list[AccountEntry], params: WithdrawRuntimeParams, dry_run: bool, one_to_many: bool) -> None:
+    dispatch_ui = getattr(app, "_dispatch_ui", lambda callback: dispatch_ui_callback(app, callback))
     try:
-        def dispatch_ui(callback) -> None:
-            try:
-                app.root.after(0, callback)
-            except Exception:
-                try:
-                    callback()
-                except Exception:
-                    pass
-
+        set_ui_batch_size(app, params.threads)
         def job_prefix(index: int, account: AccountEntry) -> str:
             if one_to_many:
                 identity = app._mask(account.address, head=8, tail=6)
@@ -235,79 +229,15 @@ def run_withdraw(app, accounts: list[AccountEntry], params: WithdrawRuntimeParam
         app.is_running = False
 
 
-def run_refresh_coin_options(app, accounts: list[AccountEntry]) -> None:
-    try:
-        app.root.after(0, lambda: app.log(f"开始按余额刷新币种：{len(accounts)} 账号"))
-        totals: dict[str, Decimal] = {}
-        ok = 0
-        failed = 0
-        lock = threading.Lock()
-        jobs: queue.Queue[tuple[int, AccountEntry]] = queue.Queue()
-        for i, acc in enumerate(accounts, start=1):
-            jobs.put((i, acc))
-
-        def worker():
-            nonlocal ok, failed
-            while True:
-                try:
-                    i, acc = jobs.get_nowait()
-                except queue.Empty:
-                    return
-                prefix = f"[{i}/{len(accounts)}][{app._mask(acc.api_key)}]"
-                try:
-                    balances = app.client.get_all_spot_balances(acc, include_zero=False)
-                    per_account_totals: dict[str, Decimal] = {}
-                    for asset, (free, locked) in balances.items():
-                        subtotal = free + locked
-                        if subtotal <= 0:
-                            continue
-                        per_account_totals[asset] = subtotal
-                    with lock:
-                        for asset, subtotal in per_account_totals.items():
-                            totals[asset] = totals.get(asset, Decimal("0")) + subtotal
-                        ok += 1
-                    app.root.after(0, lambda k=acc.api_key, d=per_account_totals: app._replace_account_coin_totals(k, d))
-                    app.root.after(0, lambda m=f"{prefix} 币种扫描完成": app.log(m))
-                except Exception as exc:
-                    with lock:
-                        failed += 1
-                    app.root.after(0, lambda m=f"{prefix} 扫描失败：{exc}": app.log(m))
-                finally:
-                    jobs.task_done()
-
-        workers: list[threading.Thread] = []
-        worker_count = max(1, min(app._runtime_worker_threads(), len(accounts)))
-        for _ in range(worker_count):
-            t = threading.Thread(target=worker, daemon=True)
-            t.start()
-            workers.append(t)
-        for t in workers:
-            t.join()
-
-        app.root.after(0, lambda: app._update_coin_options_from_totals(totals))
-        ranked = sorted(totals.items(), key=lambda x: (-x[1], x[0]))
-        if ranked:
-            top = ", ".join([f"{coin}={app._decimal_to_text(total)}" for coin, total in ranked[:8]])
-            summary = f"币种刷新结束：成功 {ok}，失败 {failed}，可用币种 {len(ranked)}；Top: {top}"
-        else:
-            summary = f"币种刷新结束：成功 {ok}，失败 {failed}，未发现可用余额币种"
-        app.root.after(0, lambda: app.log(summary))
-        app.root.after(0, lambda: messagebox.showinfo("币种刷新完成", summary))
-    except Exception as exc:
-        err_text = str(exc)
-        app.root.after(0, lambda m=f"币种刷新任务异常终止：{err_text}": app.log(m))
-        app.root.after(0, lambda e=err_text: messagebox.showerror("执行异常", e))
-    finally:
-        app.is_running = False
-
-
 def run_query_balance(app, accounts: list[AccountEntry], coin: str) -> None:
+    dispatch_ui = getattr(app, "_dispatch_ui", lambda callback: dispatch_ui_callback(app, callback))
     try:
+        set_ui_batch_size(app, app._runtime_worker_threads())
         progress_keys = [acc.api_key for acc in accounts]
-        app.root.after(0, lambda keys=progress_keys: app._begin_progress("query", keys))
-        app.root.after(0, lambda a=app._coin_amount_text(coin, Decimal("0")): app._set_progress_metrics(balance_text=a))
-        app.root.after(0, lambda: app.log(f"开始查询余额（全币种）：{len(accounts)} 账号，统计币种={coin}"))
-        app.root.after(0, lambda keys=progress_keys: app._set_query_statuses(keys, "waiting"))
+        dispatch_ui(lambda keys=progress_keys: app._begin_progress("query", keys))
+        dispatch_ui(lambda a=app._coin_amount_text(coin, Decimal("0")): app._set_progress_metrics(balance_text=a))
+        dispatch_ui(lambda: app.log(f"开始查询余额（全币种）：{len(accounts)} 账号，统计币种={coin}"))
+        dispatch_ui(lambda keys=progress_keys: app._set_query_statuses(keys, "waiting"))
 
         total = Decimal("0")
         totals_all: dict[str, Decimal] = {}
@@ -326,7 +256,7 @@ def run_query_balance(app, accounts: list[AccountEntry], coin: str) -> None:
                 except queue.Empty:
                     return
                 prefix = f"[{i}/{len(accounts)}][{app._mask(acc.api_key)}]"
-                app.root.after(0, lambda k=acc.api_key: app._set_account_query_status(k, "running"))
+                dispatch_ui(lambda k=acc.api_key: app._set_account_query_status(k, "running"))
                 try:
                     balances = app.client.get_all_spot_balances(acc, include_zero=False)
                     per_account_totals: dict[str, Decimal] = {}
@@ -341,16 +271,16 @@ def run_query_balance(app, accounts: list[AccountEntry], coin: str) -> None:
                         total += per_account_totals.get(coin, Decimal("0"))
                         ok += 1
                         balance_text = app._coin_amount_text(coin, total)
-                    app.root.after(0, lambda k=acc.api_key, d=per_account_totals: app._replace_account_coin_totals(k, d))
-                    app.root.after(0, lambda a=balance_text: app._set_progress_metrics(balance_text=a))
+                    dispatch_ui(lambda k=acc.api_key, d=per_account_totals: app._replace_account_coin_totals(k, d))
+                    dispatch_ui(lambda a=balance_text: app._set_progress_metrics(balance_text=a))
                     msg = f"{prefix} 余额 -> {app._totals_to_text(per_account_totals)}"
-                    app.root.after(0, lambda m=msg: app.log(m))
-                    app.root.after(0, lambda k=acc.api_key: app._set_account_query_status(k, "success"))
+                    dispatch_ui(lambda m=msg: app.log(m))
+                    dispatch_ui(lambda k=acc.api_key: app._set_account_query_status(k, "success"))
                 except Exception as exc:
                     with lock:
                         failed += 1
-                    app.root.after(0, lambda m=f"{prefix} 查询失败：{exc}": app.log(m))
-                    app.root.after(0, lambda k=acc.api_key: app._set_account_query_status(k, "failed"))
+                    dispatch_ui(lambda m=f"{prefix} 查询失败：{exc}": app.log(m))
+                    dispatch_ui(lambda k=acc.api_key: app._set_account_query_status(k, "failed"))
                 finally:
                     jobs.task_done()
 
@@ -363,14 +293,15 @@ def run_query_balance(app, accounts: list[AccountEntry], coin: str) -> None:
         for t in workers:
             t.join()
 
+        dispatch_ui(lambda totals=dict(totals_all): app._update_coin_options_from_totals(totals))
         top = app._totals_to_text(dict(sorted(totals_all.items(), key=lambda x: (-x[1], x[0]))[:10]))
         summary = f"余额查询结束：成功 {ok}，失败 {failed}，{coin} 合计={app._decimal_to_text(total)}，全币种Top={top}"
-        app.root.after(0, lambda: app.log(summary))
-        app.root.after(0, lambda s=ok, f=failed: app._finish_progress("query", s, f))
+        dispatch_ui(lambda: app.log(summary))
+        dispatch_ui(lambda s=ok, f=failed: app._finish_progress("query", s, f))
     except Exception as exc:
         err_text = str(exc)
-        app.root.after(0, lambda m=f"余额查询任务异常终止：{err_text}": app.log(m))
-        app.root.after(0, lambda e=err_text: messagebox.showerror("执行异常", e))
-        app.root.after(0, lambda s=ok if "ok" in locals() else 0, f=failed if "failed" in locals() else 0: app._finish_progress("query", s, f))
+        dispatch_ui(lambda m=f"余额查询任务异常终止：{err_text}": app.log(m))
+        dispatch_ui(lambda e=err_text: messagebox.showerror("执行异常", e))
+        dispatch_ui(lambda s=ok if "ok" in locals() else 0, f=failed if "failed" in locals() else 0: app._finish_progress("query", s, f))
     finally:
         app.is_running = False

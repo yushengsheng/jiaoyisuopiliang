@@ -22,7 +22,9 @@ import ip_detection
 import network_options
 import page_bitget
 import page_onchain
+import shared_utils
 import table_import_utils
+import task_progress
 import withdraw_ui
 import withdraw_account_ops
 
@@ -41,6 +43,32 @@ class DummyVar:
 class DummyRoot:
     def after(self, _ms, callback=None):
         if callback is not None:
+            callback()
+
+
+class QueuedIdleRoot:
+    def __init__(self):
+        self._callbacks: dict[str, object] = {}
+        self._seq = 0
+
+    def after(self, _ms, callback=None):
+        if callback is None:
+            return ""
+        return self.after_idle(callback)
+
+    def after_idle(self, callback):
+        self._seq += 1
+        token = f"idle_{self._seq}"
+        self._callbacks[token] = callback
+        return token
+
+    def after_cancel(self, token):
+        self._callbacks.pop(token, None)
+
+    def drain(self):
+        pending = list(self._callbacks.values())
+        self._callbacks.clear()
+        for callback in pending:
             callback()
 
 
@@ -64,6 +92,39 @@ class DummyButton:
     def configure(self, **kwargs):
         if "state" in kwargs:
             self.state = kwargs["state"]
+
+
+class FakePasteWidget:
+    def __init__(self, *, fail_event_generate: bool = False, clipboard_text: str = "clip", insert_index: int = 0):
+        self.fail_event_generate = fail_event_generate
+        self.clipboard_text = clipboard_text
+        self.insert_index = insert_index
+        self.bindings: list[tuple[str, object, str | None]] = []
+        self.generated_events: list[str] = []
+        self.deleted: list[tuple[object, object]] = []
+        self.inserted: list[tuple[object, str]] = []
+
+    def bind(self, sequence, callback, add=None):
+        self.bindings.append((sequence, callback, add))
+
+    def event_generate(self, sequence):
+        if self.fail_event_generate:
+            raise RuntimeError("event_generate failed")
+        self.generated_events.append(sequence)
+
+    def clipboard_get(self):
+        return self.clipboard_text
+
+    def index(self, name):
+        if name == "insert":
+            return self.insert_index
+        raise RuntimeError(f"unsupported index: {name}")
+
+    def delete(self, start, end):
+        self.deleted.append((start, end))
+
+    def insert(self, index, text):
+        self.inserted.append((index, text))
 
 
 class FakeLogTree:
@@ -474,6 +535,84 @@ def test_append_log_row_keeps_500_rows():
     assert tree.rows[-1][1][1] == "log-504"
 
 
+def test_queue_log_row_batches_until_idle():
+    tree = FakeLogTree()
+    owner = type("Owner", (), {})()
+    owner.root = QueuedIdleRoot()
+    owner._ui_batch_size_override = 10
+
+    shared_utils.queue_log_row(owner, tree, "log-1", root=owner.root)
+    shared_utils.queue_log_row(owner, tree, "log-2", root=owner.root)
+
+    assert len(tree.rows) == 0
+    assert len(owner.root._callbacks) == 1
+
+    owner.root.drain()
+
+    assert [row[1][1] for row in tree.rows] == ["log-1", "log-2"]
+    assert tree.last_seen == tree.rows[-1][0]
+
+
+def test_queue_ui_render_flushes_when_batch_size_reached():
+    owner = type("Owner", (), {})()
+    owner.root = QueuedIdleRoot()
+    owner._ui_batch_size_override = 2
+    seen = []
+
+    shared_utils.queue_ui_render(owner, lambda: seen.append("a"), root=owner.root)
+    assert seen == []
+
+    shared_utils.queue_ui_render(owner, lambda: seen.append("b"), root=owner.root)
+    owner.root.drain()
+
+    assert seen == ["a", "b"]
+
+
+def test_schedule_ui_callback_debounces_same_key():
+    owner = type("Owner", (), {})()
+    owner.root = QueuedIdleRoot()
+    seen = []
+
+    shared_utils.schedule_ui_callback(owner, "tree", lambda: seen.append("a"), root=owner.root)
+    shared_utils.schedule_ui_callback(owner, "tree", lambda: seen.append("b"), root=owner.root)
+
+    owner.root.drain()
+
+    assert seen == ["b"]
+
+
+def test_bind_paste_shortcuts_registers_ctrl_and_cmd_v():
+    widget = FakePasteWidget()
+
+    shared_utils.bind_paste_shortcuts(widget)
+
+    sequences = [item[0] for item in widget.bindings]
+    assert "<Command-v>" in sequences
+    assert "<Control-v>" in sequences
+
+
+def test_handle_paste_shortcut_generates_virtual_paste():
+    widget = FakePasteWidget()
+    event = type("Evt", (), {"widget": widget})()
+
+    ret = shared_utils.handle_paste_shortcut(event)
+
+    assert ret == "break"
+    assert widget.generated_events == ["<<Paste>>"]
+    assert widget.inserted == []
+
+
+def test_handle_paste_shortcut_falls_back_to_manual_insert():
+    widget = FakePasteWidget(fail_event_generate=True, clipboard_text="abc123", insert_index=4)
+    event = type("Evt", (), {"widget": widget})()
+
+    ret = shared_utils.handle_paste_shortcut(event)
+
+    assert ret == "break"
+    assert widget.generated_events == []
+    assert widget.inserted == [(4, "abc123")]
+
+
 def test_store_old_list_compat():
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "accounts.json"
@@ -499,6 +638,21 @@ def test_store_load_missing_file_clears_one_to_many_state():
         assert store.one_to_many_addresses == []
         assert store.one_to_many_source_api_key == ""
         assert store.one_to_many_source_api_secret == ""
+
+
+def test_missing_file_default_worker_threads():
+    with tempfile.TemporaryDirectory() as td:
+        account_store = app.AccountStore(Path(td) / "accounts.json")
+        account_store.load()
+        assert account_store.settings.worker_threads == 5
+
+        bg_store = app.BgOneToManyStore(Path(td) / "bg.json")
+        bg_store.load()
+        assert bg_store.settings.worker_threads == 5
+
+        onchain_store = app.OnchainStore(Path(td) / "onchain.json")
+        onchain_store.load()
+        assert onchain_store.settings.worker_threads == 10
 
 
 def test_bg_store_roundtrip():
@@ -890,7 +1044,8 @@ def test_tree_right_click_selects_row_and_shows_menu():
 def test_query_balance_current_row_uses_selected_row_only():
     w = app.WithdrawApp.__new__(app.WithdrawApp)
     w.is_running = False
-    w.coin_var = DummyVar("USDT")
+    w.coin_var = DummyVar("")
+    w.DEFAULT_COIN_OPTIONS = ["USDT", "BNB"]
     w._is_one_to_many_mode = lambda: False
     w.store = type(
         "Store",
@@ -1002,6 +1157,7 @@ def test_bitget_current_row_ops_use_selected_row_only():
     w.is_running = False
     w.store = type("Store", (), {"addresses": ["addr_1", "addr_2"]})()
     w._selected_indices = lambda: [1]
+    w.coin_var = DummyVar("USDT")
     w.dry_run_var = DummyVar(True)
     w._validate_withdraw_params = lambda: app.WithdrawRuntimeParams(
         coin="USDT",
@@ -1014,7 +1170,7 @@ def test_bitget_current_row_ops_use_selected_row_only():
     w.log_messages = []
     w.log = lambda m: w.log_messages.append(m)
     seen = {}
-    w._run_query_balance = lambda cred: (seen.update({"query_cred": cred}), setattr(w, "is_running", False))
+    w._run_query_balance = lambda cred, coin: (seen.update({"query_cred": cred, "query_coin": coin}), setattr(w, "is_running", False))
     w._run_withdraw = lambda addrs, params, cred, dry_run: seen.update(
         {"addrs": addrs, "params": params, "cred": cred, "dry_run": dry_run}
     )
@@ -1023,6 +1179,7 @@ def test_bitget_current_row_ops_use_selected_row_only():
         w.start_query_balance_current_row()
         assert not mp.warnings
         assert seen["query_cred"] == ("k", "s", "p")
+        assert seen["query_coin"] == "USDT"
         w.start_withdraw_current_row()
 
     assert not mp.warnings
@@ -1890,6 +2047,7 @@ def make_withdraw_stub():
     w.log_messages: list[str] = []
     w.log = lambda m: w.log_messages.append(m)
     w._replace_account_coin_totals = lambda api_key, totals: w.account_coin_balance_cache.__setitem__(api_key, dict(totals))
+    w._update_coin_options_from_totals = lambda totals: None
     w._totals_to_text = lambda totals: " | ".join(f"{k}:{v}" for k, v in sorted(totals.items())) if totals else "-"
     w._coin_amount_text = lambda coin, amount: f"{amount} {coin}"
     return w
@@ -1903,6 +2061,43 @@ def make_network_options_stub(*, current_coin: str = "USDT", current_api_key: st
     w._current_coin = lambda: current_coin
     w._pick_meta_account = lambda: app.AccountEntry(current_api_key, "s", "addr")
     return w
+
+
+def make_coin_network_options_stub(*, current_coin: str = "USDT", current_network: str = "BSC"):
+    w = app.BitgetOneToManyPage.__new__(app.BitgetOneToManyPage)
+    w.coin_network_cache = {}
+    w.coin_var = DummyVar(current_coin)
+    w.network_var = DummyVar(current_network)
+    w.network_box = FakeComboBox()
+    return w
+
+
+def make_coin_options_stub(*, current_coin: str = "USDT", saved_coin: str = "USDT"):
+    w = app.WithdrawApp.__new__(app.WithdrawApp)
+    w.DEFAULT_COIN_OPTIONS = ["USDT", "BNB"]
+    w.coin_balance_totals = {}
+    w.coin_var = DummyVar(current_coin)
+    w.coin_box = FakeComboBox()
+    w.store = type("Store", (), {"settings": type("Settings", (), {"coin": saved_coin})()})()
+    return w
+
+
+def test_binance_coin_options_include_bnb_without_balance_totals():
+    w = make_coin_options_stub(current_coin="USDT", saved_coin="")
+
+    w._update_coin_options_from_totals({})
+
+    assert w.coin_box.values == ["USDT", "BNB"]
+    assert w.coin_var.get() == "USDT"
+
+
+def test_binance_coin_options_keep_saved_fallback_when_totals_exclude_it():
+    w = make_coin_options_stub(current_coin="", saved_coin="BNB")
+
+    w._update_coin_options_from_totals({"BTC": Decimal("2"), "ETH": Decimal("1")})
+
+    assert w.coin_box.values == ["BNB", "BTC", "ETH"]
+    assert w.coin_var.get() == "BNB"
 
 
 def test_network_options_ignores_stale_account_context():
@@ -1939,15 +2134,46 @@ def test_network_options_applies_when_account_and_coin_match():
     assert w.network_var.get() == "BSC"
 
 
+def test_coin_network_options_ignore_stale_coin():
+    w = make_coin_network_options_stub(current_coin="USDT", current_network="BSC")
+
+    network_options.apply_coin_network_options(
+        w,
+        coin="ETH",
+        networks=["ERC20"],
+        cache_result=True,
+    )
+
+    assert w.coin_network_cache["ETH"] == ["ERC20"]
+    assert w.network_box.values == []
+    assert w.network_var.get() == "BSC"
+
+
+def test_coin_network_options_apply_on_match():
+    w = make_coin_network_options_stub(current_coin="USDT", current_network="BSC")
+
+    network_options.apply_coin_network_options(
+        w,
+        coin="USDT",
+        networks=["ERC20", "BSC", ""],
+        cache_result=True,
+    )
+
+    assert w.coin_network_cache["USDT"] == ["ERC20", "BSC"]
+    assert w.network_box.values == ["", "ERC20", "BSC"]
+    assert w.network_var.get() == "BSC"
+
+
 def make_binance_balance_stub():
     w = app.WithdrawApp.__new__(app.WithdrawApp)
     w.is_running = False
     w.coin_var = DummyVar("USDT")
+    w.DEFAULT_COIN_OPTIONS = ["USDT", "BNB"]
     w._is_one_to_many_mode = lambda: False
     w._checked_accounts = lambda: []
     w._selected_accounts = lambda: []
     w._build_source_account = lambda with_message=False: None
-    w.store = type("Store", (), {"accounts": []})()
+    w.store = type("Store", (), {"accounts": [], "settings": type("Settings", (), {"coin": ""})()})()
     return w
 
 
@@ -1993,35 +2219,20 @@ def test_binance_query_balance_checked_only_accounts():
     assert seen["accounts"] == checked_accounts
 
 
-def test_binance_refresh_coin_checked_only_accounts():
+def test_binance_query_balance_uses_default_coin_when_empty():
     w = make_binance_balance_stub()
-    checked_accounts = [
-        app.AccountEntry("k_checked_1", "s_checked_1", "a_checked_1"),
-        app.AccountEntry("k_checked_2", "s_checked_2", "a_checked_2"),
-    ]
+    w.coin_var = DummyVar("")
+    checked_accounts = [app.AccountEntry("k_checked_1", "s_checked_1", "a_checked_1")]
     w._checked_accounts = lambda: checked_accounts
-    w.store.accounts = [app.AccountEntry("k1", "s1", "a1"), app.AccountEntry("k2", "s2", "a2")]
     seen = {}
-    w._run_refresh_coin_options = lambda accounts: seen.update({"accounts": accounts})
+    w._run_query_balance = lambda accounts, coin: seen.update({"accounts": accounts, "coin": coin})
 
     with MessagePatch() as mp, ThreadPatch():
-        w.start_refresh_coin_options()
+        w.start_query_balance()
 
     assert not mp.warnings
+    assert seen["coin"] == "USDT"
     assert seen["accounts"] == checked_accounts
-
-
-def test_binance_refresh_coin_requires_checked_accounts():
-    w = make_binance_balance_stub()
-    w.store.accounts = [app.AccountEntry("k1", "s1", "a1")]
-    seen = {"called": False}
-    w._run_refresh_coin_options = lambda _accounts: seen.update({"called": True})
-
-    with MessagePatch() as mp, ThreadPatch():
-        w.start_refresh_coin_options()
-
-    assert mp.warnings and "请先勾选至少一个账号" in mp.warnings[-1][1]
-    assert seen["called"] is False
 
 
 def test_binance_query_balance_requires_checked_accounts():
@@ -2209,12 +2420,15 @@ def test_binance_query_progress_shows_balance_total():
         app.AccountEntry("good_api_1", "s1", "addr_1"),
         app.AccountEntry("bad_api_2", "s2", "addr_2"),
     ]
+    seen = {}
+    w._update_coin_options_from_totals = lambda totals: seen.update({"totals": dict(totals)})
 
     with MessagePatch():
         w._run_query_balance(accounts, "USDT")
 
     assert any("余额查询结束：成功 1，失败 1" in x for x in w.log_messages)
     assert w.progress_var.get() == "查询完成：总2 | 成功1 | 失败1 | 余额总额=1 USDT | 提现总额=- | gas总额=-"
+    assert seen["totals"] == {"USDT": Decimal("1"), "BTC": Decimal("0.5")}
 
 
 def test_binance_dry_run_all_does_not_call_balance_api():
@@ -2364,13 +2578,18 @@ def test_bitget_query_progress_shows_balance_total():
     w._active_progress_keys = []
     w.log_messages = []
     w.log = lambda m: w.log_messages.append(m)
+    seen = {}
+    w._apply_source_assets = lambda context_sig, totals, update_coin_options: seen.update(
+        {"context_sig": context_sig, "totals": dict(totals), "update_coin_options": update_coin_options}
+    )
     w._refresh_tree = lambda: None
 
     with MessagePatch():
-        w._run_query_balance(("k", "s", "p"))
+        w._run_query_balance(("k", "s", "p"), "USDT")
 
     assert any("余额查询结束" in x for x in w.log_messages)
     assert w.progress_var.get() == "查询完成：总1 | 成功1 | 失败0 | 余额总额=3 USDT | 提现总额=- | gas总额=-"
+    assert seen == {"context_sig": "k", "totals": {"USDT": Decimal("3"), "BTC": Decimal("1")}, "update_coin_options": True}
 
 
 def test_bitget_withdraw_progress_shows_amount_and_fee():
@@ -3033,6 +3252,43 @@ def test_main_startup_ignores_theme_failure():
     assert temp_dir.exists()
 
 
+def test_task_progress_cancels_pending_idle_refresh_on_finish():
+    owner = type("Owner", (), {})()
+    owner.root = QueuedIdleRoot()
+    owner._ui_batch_size_override = 10
+    owner.progress_var = DummyVar("进度：空闲")
+    owner._progress_store = lambda kind: {"k1": "running"} if kind == "query" else {}
+
+    task_progress.begin(owner, "query", ["k1"], amount_label="提现总额")
+    task_progress.set_metrics(owner, balance_text="1 USDT")
+    assert owner._progress_refresh_pending is True
+
+    owner._progress_store = lambda kind: {"k1": "success"} if kind == "query" else {}
+    task_progress.finish(owner, "query", 1, 0)
+    owner.root.drain()
+
+    assert owner.progress_var.get() == "查询完成：总1 | 成功1 | 失败0 | 余额总额=1 USDT | 提现总额=- | gas总额=-"
+
+
+def test_task_progress_coalesces_multiple_idle_refreshes():
+    owner = type("Owner", (), {})()
+    owner.root = QueuedIdleRoot()
+    owner._ui_batch_size_override = 10
+    owner.progress_var = DummyVar("进度：空闲")
+    owner._progress_store = lambda kind: {"k1": "running"} if kind == "query" else {}
+
+    task_progress.begin(owner, "query", ["k1"], amount_label="提现总额")
+    task_progress.set_metrics(owner, balance_text="1 USDT")
+    task_progress.set_metrics(owner, balance_text="2 USDT")
+
+    assert owner._progress_refresh_pending is True
+    assert len(owner.root._callbacks) == 1
+
+    owner.root.drain()
+
+    assert owner.progress_var.get() == "查询进度：0/1 | 等待0 | 进行中1 | 成功0 | 失败0 | 余额总额=2 USDT | 提现总额=- | gas总额=-"
+
+
 def test_no_except_lambda_exc_capture():
     offenders: list[tuple[str, int, str]] = []
     py_files = [p for p in ROOT_DIR.glob("**/*.py") if "__pycache__" not in p.parts]
@@ -3078,8 +3334,15 @@ def main():
         ("AccountStore roundtrip", test_store_roundtrip),
         ("AccountStore encrypts sensitive", test_store_encrypts_sensitive_fields),
         ("Append log keeps 500 rows", test_append_log_row_keeps_500_rows),
+        ("Queued log rows batch until idle", test_queue_log_row_batches_until_idle),
+        ("Queued ui render flushes on batch size", test_queue_ui_render_flushes_when_batch_size_reached),
+        ("Scheduled ui callback debounces same key", test_schedule_ui_callback_debounces_same_key),
+        ("Bind paste shortcuts", test_bind_paste_shortcuts_registers_ctrl_and_cmd_v),
+        ("Paste shortcut generates virtual paste", test_handle_paste_shortcut_generates_virtual_paste),
+        ("Paste shortcut fallback insert", test_handle_paste_shortcut_falls_back_to_manual_insert),
         ("AccountStore old format", test_store_old_list_compat),
         ("AccountStore missing file clears one-to-many", test_store_load_missing_file_clears_one_to_many_state),
+        ("Missing file default worker threads", test_missing_file_default_worker_threads),
         ("Bitget store roundtrip", test_bg_store_roundtrip),
         ("Bitget store encrypts sensitive", test_bg_store_encrypts_sensitive_fields),
         ("Onchain store roundtrip", test_onchain_store_roundtrip),
@@ -3132,11 +3395,14 @@ def main():
         ("Onchain save rejects invalid random", test_onchain_save_rejects_invalid_random_amount_range),
         ("Random amount two decimals", test_random_amount_two_decimals),
         ("Bitget random amount two decimals", test_bg_random_amount_two_decimals),
+        ("Binance coin options include BNB by default", test_binance_coin_options_include_bnb_without_balance_totals),
+        ("Binance coin options keep saved fallback", test_binance_coin_options_keep_saved_fallback_when_totals_exclude_it),
         ("Network options ignore stale account", test_network_options_ignores_stale_account_context),
         ("Network options apply on match", test_network_options_applies_when_account_and_coin_match),
+        ("Coin network options ignore stale coin", test_coin_network_options_ignore_stale_coin),
+        ("Coin network options apply on match", test_coin_network_options_apply_on_match),
         ("Binance query checked only", test_binance_query_balance_checked_only_accounts),
-        ("Binance refresh checked only", test_binance_refresh_coin_checked_only_accounts),
-        ("Binance refresh requires checked", test_binance_refresh_coin_requires_checked_accounts),
+        ("Binance query uses default coin when empty", test_binance_query_balance_uses_default_coin_when_empty),
         ("Binance query requires checked", test_binance_query_balance_requires_checked_accounts),
         ("Binance withdraw checked only", test_binance_batch_withdraw_checked_only_accounts),
         ("Binance withdraw requires checked", test_binance_batch_withdraw_requires_checked_accounts),
@@ -3164,6 +3430,8 @@ def main():
         ("Fetch public IP skips invalid payload", test_fetch_public_ip_skips_invalid_payload),
         ("Apple theme tolerates style failures", test_apply_apple_theme_tolerates_style_failures),
         ("Main startup ignores theme failure", test_main_startup_ignores_theme_failure),
+        ("Task progress cancels pending idle refresh", test_task_progress_cancels_pending_idle_refresh_on_finish),
+        ("Task progress coalesces idle refreshes", test_task_progress_coalesces_multiple_idle_refreshes),
         ("No except-lambda exc capture", test_no_except_lambda_exc_capture),
     ]
 

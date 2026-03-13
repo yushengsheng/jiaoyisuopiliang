@@ -7,6 +7,8 @@ import ipaddress
 import threading
 import urllib.request
 
+from shared_utils import dispatch_ui_callback
+
 
 def start_detect_ip(app) -> None:
     if not hasattr(app, "ip_detect_lock"):
@@ -62,11 +64,11 @@ def fetch_public_ip() -> str:
 def run_detect_ip(app) -> None:
     try:
         ip = fetch_public_ip()
-        app.root.after(0, lambda: app.ip_var.set(ip))
-        app.root.after(0, lambda: app.log(f"公网IP：{ip}"))
+        dispatch_ui_callback(app, lambda: app.ip_var.set(ip))
+        dispatch_ui_callback(app, lambda: app.log(f"公网IP：{ip}"))
     except Exception as exc:
         err_text = str(exc)
-        app.root.after(0, lambda: app.ip_var.set("检测失败"))
-        app.root.after(0, lambda m=f"IP 检测失败：{err_text}": app.log(m))
+        dispatch_ui_callback(app, lambda: app.ip_var.set("检测失败"))
+        dispatch_ui_callback(app, lambda m=f"IP 检测失败：{err_text}": app.log(m))
     finally:
-        app.root.after(0, app._finish_detect_ip)
+        dispatch_ui_callback(app, app._finish_detect_ip)

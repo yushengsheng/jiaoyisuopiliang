@@ -9,6 +9,23 @@ from tkinter import messagebox
 from core_models import AccountEntry
 
 
+def _query_balance_stat_coin(app) -> str:
+    current = ""
+    if hasattr(app, "coin_var"):
+        try:
+            current = app.coin_var.get().strip().upper()
+        except Exception:
+            current = ""
+    if current:
+        return current
+    settings = getattr(getattr(app, "store", None), "settings", None)
+    saved = str(getattr(settings, "coin", "") or "").strip().upper()
+    if saved:
+        return saved
+    defaults = list(getattr(app, "DEFAULT_COIN_OPTIONS", ["USDT"]))
+    return str(defaults[0] if defaults else "USDT").strip().upper()
+
+
 def _has_submitted_records(app) -> bool:
     if app._is_one_to_many_mode():
         return any(app._display_account_status(addr) == "submitted" for addr in app.store.one_to_many_addresses)
@@ -128,36 +145,12 @@ def start_retry_failed(app) -> None:
     t.start()
 
 
-def start_refresh_coin_options(app) -> None:
-    if app.is_running:
-        messagebox.showwarning("提示", "已有任务在运行")
-        return
-
-    if app._is_one_to_many_mode():
-        source = app._build_source_account(with_message=True)
-        if not source:
-            return
-        accounts = [source]
-    else:
-        accounts = app._checked_accounts()
-        if not accounts:
-            messagebox.showwarning("提示", "请先勾选至少一个账号")
-            return
-
-    app.is_running = True
-    t = threading.Thread(target=app._run_refresh_coin_options, args=(accounts,), daemon=True)
-    t.start()
-
-
 def start_query_balance(app) -> None:
     if app.is_running:
         messagebox.showwarning("提示", "已有任务在运行")
         return
 
-    coin = app.coin_var.get().strip().upper()
-    if not coin:
-        messagebox.showerror("参数错误", "请先填写币种（用于查询余额）")
-        return
+    coin = _query_balance_stat_coin(app)
 
     if app._is_one_to_many_mode():
         source = app._build_source_account(with_message=False)

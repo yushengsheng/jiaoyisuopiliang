@@ -11,7 +11,7 @@ from tkinter import ttk
 from api_clients import BinanceClient
 from app_paths import DATA_FILE
 import batch_actions
-from binance_tasks import run_query_balance, run_refresh_coin_options, run_withdraw
+from binance_tasks import run_query_balance, run_withdraw
 from core_models import (
     AccountEntry,
     WithdrawRuntimeParams,
@@ -25,16 +25,22 @@ import withdraw_ui
 import withdraw_view_state
 from shared_utils import (
     LOG_MAX_ROWS,
-    append_log_row,
+    clear_ui_batch_size,
     decimal_to_text,
+    dispatch_ui_callback,
+    flush_queued_log_rows,
+    flush_queued_ui_renders,
     make_scrollbar,
     mask_text,
     parse_worker_threads,
+    queue_log_row,
+    schedule_ui_callback,
 )
 from stores import AccountStore
 import withdraw_account_ops as account_ops
 
 class WithdrawApp:
+    DEFAULT_COIN_OPTIONS = ["USDT", "BNB"]
     MODE_M2M = "多对多"
     MODE_1M = "1对多"
     AMOUNT_MODE_FIXED = "固定数量"
@@ -112,7 +118,7 @@ class WithdrawApp:
         self.source_api_secret_var = StringVar(value="")
         self.source_balance_var = StringVar(value="-")
         self.delay_var = DoubleVar(value=1.0)
-        self.threads_var = StringVar(value="2")
+        self.threads_var = StringVar(value="5")
         self.dry_run_var = BooleanVar(value=True)
         self.ip_var = StringVar(value="未检测")
         self.progress_var = StringVar(value=task_progress.idle_text("提现总额"))
@@ -153,8 +159,8 @@ class WithdrawApp:
         return mode
 
     def _runtime_worker_threads(self) -> int:
-        raw = self.threads_var.get() if hasattr(self, "threads_var") else 2
-        return parse_worker_threads(raw, default=2)
+        raw = self.threads_var.get() if hasattr(self, "threads_var") else 5
+        return parse_worker_threads(raw, default=5)
 
     def _apply_amount_input_layout(self):
         withdraw_ui.apply_amount_input_layout(self)
@@ -266,7 +272,18 @@ class WithdrawApp:
     def _refresh_progress_if_active(self, kind: str, row_key: str):
         task_progress.refresh_if_active(self, kind, row_key)
 
+    def _dispatch_ui(self, callback) -> None:
+        dispatch_ui_callback(self, callback)
+
+    def _schedule_tree_refresh(self) -> None:
+        schedule_ui_callback(self, "tree_refresh", self._refresh_tree, root=getattr(self, "root", None))
+
     def _finish_progress(self, kind: str, success: int, failed: int):
+        flush_queued_ui_renders(self)
+        log_tree = getattr(self, "log_tree", None)
+        if log_tree is not None:
+            flush_queued_log_rows(self, log_tree, max_rows=LOG_MAX_ROWS)
+        clear_ui_batch_size(self)
         task_progress.finish(self, kind, success, failed)
 
     def _set_query_statuses(self, row_keys: list[str], status: str):
@@ -368,7 +385,7 @@ class WithdrawApp:
         account_ops.save_all(self)
 
     def log(self, text: str):
-        append_log_row(self.log_tree, text, max_rows=LOG_MAX_ROWS)
+        queue_log_row(self, self.log_tree, text, root=getattr(self, "root", None), max_rows=LOG_MAX_ROWS)
 
     def start_detect_ip(self):
         ip_detection.start_detect_ip(self)
@@ -401,12 +418,6 @@ class WithdrawApp:
 
     def _run_withdraw(self, accounts: list[AccountEntry], params: WithdrawRuntimeParams, dry_run: bool, one_to_many: bool):
         run_withdraw(self, accounts, params, dry_run, one_to_many)
-
-    def start_refresh_coin_options(self):
-        batch_actions.start_refresh_coin_options(self)
-
-    def _run_refresh_coin_options(self, accounts: list[AccountEntry]):
-        run_refresh_coin_options(self, accounts)
 
     def start_query_balance(self):
         batch_actions.start_query_balance(self)

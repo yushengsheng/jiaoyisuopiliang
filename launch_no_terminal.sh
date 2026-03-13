@@ -13,11 +13,11 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
 fi
 
 CANDIDATES=(
+  "$SCRIPT_DIR/.venv/bin/python"
   "/opt/homebrew/bin/python3.11"
   "/opt/homebrew/bin/python3.12"
   "/opt/homebrew/bin/python3.13"
   "/opt/homebrew/bin/python3"
-  "$SCRIPT_DIR/.venv/bin/python"
   "python3"
 )
 
@@ -74,14 +74,13 @@ if pgrep -f "$SCRIPT_DIR/main.py" >/dev/null 2>&1; then
   exit 0
 fi
 
-ALL_CANDIDATES=()
+ALL_CANDIDATES=("${CANDIDATES[@]}")
 if [ -f "$PY_CACHE_FILE" ]; then
   cached_py="$(cat "$PY_CACHE_FILE" 2>/dev/null || true)"
   if [ -n "$cached_py" ]; then
     ALL_CANDIDATES+=("$cached_py")
   fi
 fi
-ALL_CANDIDATES+=("${CANDIDATES[@]}")
 
 seen_bins=""
 for p in "${ALL_CANDIDATES[@]}"; do

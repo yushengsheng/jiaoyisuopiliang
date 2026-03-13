@@ -89,9 +89,9 @@ class AccountStore:
         self.one_to_many_source_api_key = SECRET_BOX.decrypt(str(one_to_many_raw.get("api_key", "") or "").strip()).strip()
         self.one_to_many_source_api_secret = SECRET_BOX.decrypt(str(one_to_many_raw.get("api_secret", "") or "").strip()).strip()
         try:
-            worker_threads = max(1, int(settings_raw.get("worker_threads", 2)))
+            worker_threads = max(1, int(settings_raw.get("worker_threads", 5)))
         except Exception:
-            worker_threads = 2
+            worker_threads = 5
         try:
             delay_seconds = float(settings_raw.get("delay_seconds", 1.0))
             if delay_seconds < 0:
@@ -191,9 +191,9 @@ class BgOneToManyStore:
         except Exception:
             delay = 1.0
         try:
-            threads = max(1, int(settings_raw.get("worker_threads", 2)))
+            threads = max(1, int(settings_raw.get("worker_threads", 5)))
         except Exception:
-            threads = 2
+            threads = 5
 
         self.addresses = addrs
         self.settings = BgOneToManySettings(
@@ -291,9 +291,9 @@ class OnchainStore:
         except Exception:
             delay = 1.0
         try:
-            threads = max(1, int(settings_raw.get("worker_threads", 2)))
+            threads = max(1, int(settings_raw.get("worker_threads", 10)))
         except Exception:
-            threads = 2
+            threads = 10
 
         self.multi_to_multi_pairs = pairs
         self.one_to_many_addresses = one_many_list

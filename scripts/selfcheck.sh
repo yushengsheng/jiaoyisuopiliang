@@ -13,18 +13,29 @@ else
   exit 1
 fi
 
-echo "[1/4] 语法检查"
+echo "[1/5] 语法检查"
 if command -v rg >/dev/null 2>&1; then
   rg --files -g '*.py' -0 | xargs -0 "$PYTHON_BIN" -m py_compile
 else
   find . -type f -name '*.py' -print0 | xargs -0 "$PYTHON_BIN" -m py_compile
 fi
 
-echo "[2/4] 运行冒烟测试"
+echo "[2/5] 运行环境检查"
+"$PYTHON_BIN" - <<'PY'
+import importlib.util
+missing = [name for name in ("eth_account", "eth_utils") if importlib.util.find_spec(name) is None]
+if missing:
+    print(f"[WARN] 当前解释器缺少链上依赖：{', '.join(missing)}")
+    print("[WARN] 可执行：python -m pip install -r requirements-runtime.txt")
+else:
+    print("[OK] 链上运行依赖已就绪")
+PY
+
+echo "[3/5] 运行冒烟测试"
 "$PYTHON_BIN" tests/smoke_test.py
 
-echo "[3/4] 运行 pytest"
+echo "[4/5] 运行 pytest"
 "$PYTHON_BIN" -m pytest -q
 
-echo "[4/4] 完成"
+echo "[5/5] 完成"
 echo "自检通过：语法、冒烟、pytest 全部通过。"

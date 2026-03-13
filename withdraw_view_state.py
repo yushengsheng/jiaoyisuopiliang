@@ -7,6 +7,7 @@ from decimal import Decimal
 from tkinter import messagebox
 
 from core_models import AccountEntry
+from shared_utils import queue_ui_render
 import task_progress
 
 
@@ -52,6 +53,10 @@ def on_source_api_changed(app, *_args) -> None:
         return
     if not app.is_running:
         task_progress.reset_metrics(app, amount_label="提现总额")
+    refresh = getattr(app, "_schedule_tree_refresh", None)
+    if callable(refresh):
+        refresh()
+        return
     app._refresh_tree()
 
 
@@ -70,13 +75,12 @@ def on_coin_var_changed(app, *_args) -> None:
 def update_coin_options_from_totals(app, totals: dict[str, Decimal]) -> None:
     app.coin_balance_totals = dict(totals)
     ranked = sorted(totals.items(), key=lambda x: (-x[1], x[0]))
-    options = [coin for coin, _ in ranked]
+    default_options = list(getattr(app, "DEFAULT_COIN_OPTIONS", ["USDT", "BNB"]))
+    options = [coin for coin, _ in ranked] or list(default_options)
     current = app.coin_var.get().strip().upper()
     fallback = current or (app.store.settings.coin or "USDT")
     if fallback and fallback not in options:
         options.insert(0, fallback)
-    if not options:
-        options = ["USDT"]
     app.coin_box.configure(values=options)
     if current and current in options:
         app.coin_var.set(current)
@@ -173,15 +177,7 @@ def set_account_status(app, api_key: str, status: str) -> None:
         _ensure_withdraw_status_context(app)[api_key] = _one_to_many_status_context(app)
     else:
         _ensure_withdraw_status_context(app).pop(api_key, None)
-    row_id = getattr(app, "row_id_by_api_key", {}).get(api_key)
-    row_index_map = getattr(app, "row_index_map", {})
-    if row_id and row_id in row_index_map:
-        values = list(app.tree.item(row_id, "values"))
-        if len(values) >= 7:
-            values[5] = app._withdraw_status_text(api_key)
-            app.tree.item(row_id, values=values)
-        tag = app._withdraw_status_tag(status)
-        app.tree.item(row_id, tags=(tag,) if tag else ())
+    queue_ui_render(app, lambda k=api_key: _refresh_account_row_view(app, k), root=getattr(app, "root", None))
     if hasattr(app, "_refresh_progress_if_active"):
         app._refresh_progress_if_active("withdraw", api_key)
 
@@ -190,15 +186,7 @@ def set_account_query_status(app, api_key: str, status: str) -> None:
     if not hasattr(app, "account_query_status"):
         app.account_query_status = {}
     app.account_query_status[api_key] = status
-    row_id = getattr(app, "row_id_by_api_key", {}).get(api_key)
-    row_index_map = getattr(app, "row_index_map", {})
-    if row_id and row_id in row_index_map:
-        values = list(app.tree.item(row_id, "values"))
-        if len(values) >= 7:
-            values[5] = app._withdraw_status_text(api_key)
-            app.tree.item(row_id, values=values)
-        tag = app._withdraw_status_tag(display_status(app, api_key))
-        app.tree.item(row_id, tags=(tag,) if tag else ())
+    queue_ui_render(app, lambda k=api_key: _refresh_account_row_view(app, k), root=getattr(app, "root", None))
     if hasattr(app, "_refresh_progress_if_active"):
         app._refresh_progress_if_active("query", api_key)
 
@@ -219,9 +207,18 @@ def replace_account_coin_totals(app, api_key: str, totals: dict[str, Decimal]) -
         app._update_source_balance_display()
         app._refresh_tree()
         return
-    row_id = app.row_id_by_api_key.get(api_key)
-    if row_id and row_id in app.row_index_map:
-        values = list(app.tree.item(row_id, "values"))
-        if len(values) >= 7:
-            values[6] = app._all_balances_text(api_key)
-            app.tree.item(row_id, values=values)
+    queue_ui_render(app, lambda k=api_key: _refresh_account_row_view(app, k), root=getattr(app, "root", None))
+
+
+def _refresh_account_row_view(app, api_key: str) -> None:
+    row_id = getattr(app, "row_id_by_api_key", {}).get(api_key)
+    row_index_map = getattr(app, "row_index_map", {})
+    if not row_id or row_id not in row_index_map:
+        return
+    values = list(app.tree.item(row_id, "values"))
+    if len(values) >= 7:
+        values[5] = app._withdraw_status_text(api_key)
+        values[6] = app._all_balances_text(api_key)
+        app.tree.item(row_id, values=values)
+    tag = app._withdraw_status_tag(display_status(app, api_key))
+    app.tree.item(row_id, tags=(tag,) if tag else ())

@@ -14,13 +14,13 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
   set +a
 fi
 
-# 按优先级选择 Python（优先 Homebrew 版本，避免系统 python3 的 Tk 崩溃问题）
+# 按优先级选择 Python（优先项目 .venv，其次 Homebrew，避免系统 python3 的 Tk 崩溃问题）
 CANDIDATES=(
+  "$SCRIPT_DIR/.venv/bin/python"
   "/opt/homebrew/bin/python3.11"
   "/opt/homebrew/bin/python3.12"
   "/opt/homebrew/bin/python3.13"
   "/opt/homebrew/bin/python3"
-  "$SCRIPT_DIR/.venv/bin/python"
   "python3"
 )
 
@@ -59,14 +59,13 @@ LOG_DIR="$SCRIPT_DIR/data"
 mkdir -p "$LOG_DIR"
 PY_CACHE_FILE="$LOG_DIR/python_launcher_path.txt"
 
-ALL_CANDIDATES=()
+ALL_CANDIDATES=("${CANDIDATES[@]}")
 if [ -f "$PY_CACHE_FILE" ]; then
   cached_py="$(cat "$PY_CACHE_FILE" 2>/dev/null || true)"
   if [ -n "$cached_py" ]; then
     ALL_CANDIDATES+=("$cached_py")
   fi
 fi
-ALL_CANDIDATES+=("${CANDIDATES[@]}")
 
 VALID_BINS=()
 seen_bins=""

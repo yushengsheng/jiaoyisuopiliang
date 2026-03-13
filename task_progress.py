@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from shared_utils import UI_BATCH_DELAY_MS, current_ui_batch_size
+
 
 def _task_title(kind: str, finished: bool) -> str:
     if kind == "query":
@@ -39,6 +41,12 @@ def ensure_state(owner, *, amount_label: str = "总额") -> None:
         owner._summary_amount_text = "-"
     if not hasattr(owner, "_summary_gas_text"):
         owner._summary_gas_text = "-"
+    if not hasattr(owner, "_progress_refresh_pending"):
+        owner._progress_refresh_pending = False
+    if not hasattr(owner, "_progress_refresh_token"):
+        owner._progress_refresh_token = None
+    if not hasattr(owner, "_progress_refresh_requests"):
+        owner._progress_refresh_requests = 0
 
 
 def idle_text(amount_label: str = "总额") -> str:
@@ -92,7 +100,7 @@ def reset_metrics(owner, *, amount_label: str | None = None) -> None:
     owner._summary_balance_text = "-"
     owner._summary_amount_text = "-"
     owner._summary_gas_text = "-"
-    refresh_display(owner)
+    _render_display_now(owner)
 
 
 def set_metrics(
@@ -123,10 +131,10 @@ def begin(owner, kind: str, row_keys: list[str], *, amount_label: str) -> None:
     owner._summary_balance_text = "-"
     owner._summary_amount_text = "-"
     owner._summary_gas_text = "-"
-    refresh_display(owner)
+    _render_display_now(owner)
 
 
-def refresh_display(owner) -> None:
+def _render_display(owner) -> None:
     if not hasattr(owner, "progress_var"):
         return
     ensure_state(owner, amount_label=getattr(owner, "_progress_amount_label", "总额"))
@@ -145,6 +153,57 @@ def refresh_display(owner) -> None:
     )
 
 
+def _run_scheduled_refresh(owner) -> None:
+    ensure_state(owner, amount_label=getattr(owner, "_progress_amount_label", "总额"))
+    owner._progress_refresh_pending = False
+    owner._progress_refresh_token = None
+    owner._progress_refresh_requests = 0
+    _render_display(owner)
+
+
+def _cancel_scheduled_refresh(owner) -> None:
+    ensure_state(owner, amount_label=getattr(owner, "_progress_amount_label", "总额"))
+    token = getattr(owner, "_progress_refresh_token", None)
+    root = getattr(owner, "root", None)
+    after_cancel = getattr(root, "after_cancel", None)
+    if token is not None and callable(after_cancel):
+        try:
+            after_cancel(token)
+        except Exception:
+            pass
+    owner._progress_refresh_pending = False
+    owner._progress_refresh_token = None
+
+
+def _render_display_now(owner) -> None:
+    _cancel_scheduled_refresh(owner)
+    owner._progress_refresh_requests = 0
+    _render_display(owner)
+
+
+def refresh_display(owner) -> None:
+    if not hasattr(owner, "progress_var"):
+        return
+    ensure_state(owner, amount_label=getattr(owner, "_progress_amount_label", "总额"))
+    owner._progress_refresh_requests += 1
+    if owner._progress_refresh_requests >= current_ui_batch_size(owner, default=1):
+        _render_display_now(owner)
+        return
+    if getattr(owner, "_progress_refresh_pending", False):
+        return
+    root = getattr(owner, "root", None)
+    after = getattr(root, "after", None)
+    if callable(after):
+        try:
+            owner._progress_refresh_pending = True
+            owner._progress_refresh_token = after(max(1, int(UI_BATCH_DELAY_MS)), lambda: _run_scheduled_refresh(owner))
+            return
+        except Exception:
+            owner._progress_refresh_pending = False
+            owner._progress_refresh_token = None
+    _render_display(owner)
+
+
 def refresh_if_active(owner, kind: str, row_key: str) -> None:
     ensure_state(owner, amount_label=getattr(owner, "_progress_amount_label", "总额"))
     if getattr(owner, "_active_progress_kind", "") != kind:
@@ -158,6 +217,7 @@ def finish(owner, kind: str, success: int, failed: int) -> None:
     ensure_state(owner, amount_label=getattr(owner, "_progress_amount_label", "总额"))
     if not hasattr(owner, "progress_var"):
         return
+    _cancel_scheduled_refresh(owner)
     if getattr(owner, "_active_progress_kind", "") == kind:
         row_keys = list(getattr(owner, "_active_progress_keys", []))
         _waiting, _running, actual_success, actual_failed, actual_submitted = progress_counts(owner, kind, row_keys)
