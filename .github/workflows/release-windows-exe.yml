@@ -27,22 +27,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-runtime.txt pyinstaller
 
-      - name: Build EXE (windowed, no console)
+      - name: Build EXE (onefile, windowed, no console)
         run: |
-          pyinstaller --noconfirm --clean --windowed --name jiaoyisuopiliang --collect-submodules eth_account --collect-submodules eth_utils main.py
+          pyinstaller --noconfirm --clean --onefile --windowed --name jiaoyisuopiliang --collect-submodules eth_account --collect-submodules eth_utils main.py
 
-      - name: Package ZIP
+      - name: Package single EXE
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path release -Force | Out-Null
+          $exeName = "jiaoyisuopiliang-${{ github.ref_name }}-windows-x64.exe"
           $zipName = "jiaoyisuopiliang-${{ github.ref_name }}-windows-x64.zip"
-          Compress-Archive -Path "dist/jiaoyisuopiliang/*" -DestinationPath "release/$zipName" -Force
+          Copy-Item "dist/jiaoyisuopiliang.exe" "release/$exeName"
+          Compress-Archive -Path "release/$exeName" -DestinationPath "release/$zipName" -Force
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v6
         with:
           name: jiaoyisuopiliang-windows
-          path: release/*.zip
+          path: release/*
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -51,7 +53,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ github.ref_name }}"
-          $assets = Get-ChildItem "release/*.zip" | ForEach-Object { $_.FullName }
+          $assets = Get-ChildItem "release/*" | ForEach-Object { $_.FullName }
 
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
